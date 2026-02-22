@@ -1086,6 +1086,20 @@ impl MemoryVizApp {
             format!("{:.0}us", us)
         }
     }
+
+    /// Find the most recent annotation at or before the given time (microseconds).
+    /// Binary searches the sorted annotations list.
+    fn find_annotation_at(&self, time_us: f64) -> Option<&PairedAnnotation> {
+        let anns = &self.layout.annotations;
+        if anns.is_empty() {
+            return None;
+        }
+        let idx = anns.partition_point(|a| a.start_us <= time_us);
+        if idx == 0 {
+            return None;
+        }
+        Some(&anns[idx - 1])
+    }
 }
 
 impl eframe::App for MemoryVizApp {
@@ -1219,6 +1233,13 @@ impl eframe::App for MemoryVizApp {
                             Self::format_bytes(info.total_allocated_bytes as f64),
                             Self::format_bytes(info.total_at_dealloc_bytes as f64),
                         ));
+                        if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
+                            let ann_label = ann.name.replace("##", "").trim().to_string();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 190, 100),
+                                format!("| Annotation: {}", ann_label),
+                            );
+                        }
                         if is_pinned {
                             ui.label("| [pinned] Click empty to unpin | Ctrl+C to copy");
                         } else {
@@ -1346,10 +1367,24 @@ impl eframe::App for MemoryVizApp {
                 );
             }
 
-            // Draw annotations
+            // Draw annotations with label de-overlapping
             if self.show_annotations {
                 let ann_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 76);
                 let ann_text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 128);
+                let font = egui::FontId::proportional(9.0);
+                let row_spacing = 12.0_f32;
+                let num_rows = 4_usize;
+                let label_padding = 6.0_f32; // horizontal gap between labels
+
+                // First pass: draw vertical lines and collect visible labels
+                struct LabelInfo {
+                    x: f32,
+                    width: f32,
+                    label: String,
+                    color: egui::Color32,
+                }
+                let mut labels: Vec<LabelInfo> = Vec::new();
+
                 for ann in &self.layout.annotations {
                     let ann_x = us_to_screen_x(ann.start_us);
                     if ann_x >= chart_rect.min.x && ann_x <= chart_rect.max.x {
@@ -1362,13 +1397,9 @@ impl eframe::App for MemoryVizApp {
                         );
 
                         let label = ann.name.replace("##", "").trim().to_string();
-                        painter.text(
-                            egui::pos2(ann_x + 3.0, chart_rect.min.y + 12.0),
-                            egui::Align2::LEFT_TOP,
-                            &label,
-                            egui::FontId::proportional(9.0),
-                            ann_text_color,
-                        );
+                        let galley = painter.layout_no_wrap(label.clone(), font.clone(), ann_text_color);
+                        let width = galley.size().x;
+                        labels.push(LabelInfo { x: ann_x, width, label, color: ann_text_color });
                     }
 
                     if let Some(end_us) = ann.end_us {
@@ -1384,8 +1415,58 @@ impl eframe::App for MemoryVizApp {
                                     egui::Color32::from_rgba_premultiplied(255, 255, 255, 40),
                                 ),
                             );
+
+                            let end_label = format!(
+                                "{} [end]",
+                                ann.name.replace("##", "").trim()
+                            );
+                            let end_text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, 76);
+                            let galley = painter.layout_no_wrap(end_label.clone(), font.clone(), end_text_color);
+                            let width = galley.size().x;
+                            labels.push(LabelInfo { x: end_x, width, label: end_label, color: end_text_color });
                         }
                     }
+                }
+
+                // Sort labels left-to-right (end markers may interleave with starts)
+                labels.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+
+                // Second pass: assign labels to rows using greedy stagger
+                // row_ends[r] = rightmost x extent of labels assigned to row r
+                let mut row_ends: Vec<f32> = vec![f32::NEG_INFINITY; num_rows];
+
+                for info in &labels {
+                    let label_left = info.x + 3.0;
+                    let label_right = label_left + info.width + label_padding;
+
+                    // Find first row where this label doesn't overlap
+                    let mut assigned_row = 0;
+                    for r in 0..num_rows {
+                        if label_left >= row_ends[r] {
+                            assigned_row = r;
+                            break;
+                        }
+                        // If no row fits, use the one with the smallest extent
+                        if r == num_rows - 1 {
+                            assigned_row = row_ends
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                        }
+                    }
+
+                    row_ends[assigned_row] = label_right;
+                    let y = chart_rect.min.y + 12.0 + (assigned_row as f32) * row_spacing;
+
+                    painter.text(
+                        egui::pos2(info.x + 3.0, y),
+                        egui::Align2::LEFT_TOP,
+                        &info.label,
+                        font.clone(),
+                        info.color,
+                    );
                 }
             }
 
@@ -1584,6 +1665,13 @@ impl eframe::App for MemoryVizApp {
                                     Self::format_bytes(info.total_at_dealloc_bytes as f64)
                                 ));
                             }
+                            if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
+                                let ann_label = ann.name.replace("##", "").trim().to_string();
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(230, 190, 100),
+                                    format!("Annotation: {}", ann_label),
+                                );
+                            }
                         });
                     } else if !self.tooltip_dismissed {
                         let rel_us = hover_us - self.layout.time_min_us as f64;
@@ -1593,6 +1681,13 @@ impl eframe::App for MemoryVizApp {
                                 Self::format_time_us(rel_us),
                                 Self::format_bytes(hover_bytes),
                             ));
+                            if let Some(ann) = self.find_annotation_at(hover_us) {
+                                let ann_label = ann.name.replace("##", "").trim().to_string();
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(230, 190, 100),
+                                    format!("Annotation: {}", ann_label),
+                                );
+                            }
                         });
                     }
                 }
