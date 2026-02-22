@@ -1,0 +1,98 @@
+# desktop-memory-viz
+
+Native GPU-accelerated CUDA memory timeline visualizer. Replaces PyTorch's
+browser-based visualizer at https://pytorch.org/memory_viz which crashes on
+large (~1 GB+) snapshot files.
+
+Renders the "Active Memory Timeline" view: allocations shown as stacked
+polygons where freeing a lower allocation causes everything above to slide
+down. Handles 900K+ allocations at interactive framerates via texture-based
+rasterization.
+
+![desktop-memory-viz screenshot](assets/gemma_4b_it_annotated.png)
+
+## Building
+
+```bash
+cargo build --release
+```
+
+## Usage
+
+```bash
+# From a pickle file (auto-calls Python to extract JSON, caches result)
+./target/release/desktop-memory-viz snapshot.pickle
+
+# From pre-extracted JSON (skips Python step)
+python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
+./target/release/desktop-memory-viz snapshot.extracted.json
+
+# Track all allocations individually (default: top 1,000,000 by size)
+./target/release/desktop-memory-viz snapshot.pickle --max-entries 10000000
+
+# Fetch model config from HuggingFace for tensor shape display
+./target/release/desktop-memory-viz snapshot.pickle --model google/gemma-3-4b-it
+
+# Also show 4-bit and int8 factorizations (for quantized models)
+./target/release/desktop-memory-viz snapshot.pickle --model google/gemma-3-4b-it --quantized
+
+# Filter annotations to a specific pattern
+./target/release/desktop-memory-viz snapshot.pickle --annotation-filter "grpo"
+
+# Show all annotations including PyTorch internals
+./target/release/desktop-memory-viz snapshot.pickle --all-annotations
+```
+
+## Controls
+
+| Action | Effect |
+|--------|--------|
+| Scroll | Zoom X axis (centered on cursor) |
+| Shift+Scroll | Zoom Y axis |
+| Drag | Pan |
+| Cmd+Drag | Select horizontal region to zoom into |
+| Double-click | Fit Y axis to data |
+| Hover | Tooltip with allocation size, duration, tensor shape |
+| Click | Pin allocation to bottom bar (persists while navigating) |
+| Click empty space | Unpin |
+| Right-click | Dismiss tooltip (keeps highlight outline) |
+| Ctrl+C | Copy stack trace of pinned/hovered allocation |
+
+## Features
+
+- **Stacked area chart** matching PyTorch's Active Memory Timeline view
+- **Texture rasterization** — renders 900K+ polygons as a single GPU texture,
+  with O(1) hover detection via a pixel-indexed lookup map
+- **Cmd+drag region selection** — select a horizontal time range to zoom into
+- **Click-to-pin** — click an allocation to pin its details to the bottom bar;
+  the bottom bar shows hover info by default and pinned info after clicking.
+  Pinned allocations get a red outline, hovered allocations get a white outline
+- **Bottom bar** — fixed panel with allocation details, stack trace (scrollable),
+  tensor shape factorizations, and total memory at allocation/deallocation
+- **Tensor shape display** (`--model`) — fetches `config.json` from HuggingFace
+  (supports gated models via `~/.cache/huggingface/token` or `$HF_TOKEN`) and
+  shows tensor sizes as factorizations of `hidden_size` (H) and
+  `intermediate_size` (I) across dtypes (bf16, fp32; also 4-bit, int8 with
+  `--quantized`)
+- **Annotation filtering** — auto-hides PyTorch dynamo/inductor internal
+  annotations (CompiledFxGraph, pad_mm_benchmark, etc.), showing only
+  user-defined markers by default
+- **FPS counter** — displayed in the header bar
+- **JSON caching** — pickle-to-JSON conversion is cached; subsequent runs skip
+  Python extraction if the JSON is newer than the pickle
+
+## Performance
+
+On a 490 MB pickle (Gemma 4B, 2.7M events, 926K allocations):
+
+| Step | Time |
+|------|------|
+| JSON parse (cached) | 0.2s |
+| Polygon layout | 0.8s |
+| **Total startup** | **~1.0s** |
+
+## Requirements
+
+- Rust (for building)
+- Python 3 with `torch` (for pickle extraction; only needed when passing
+  `.pickle` files directly)
