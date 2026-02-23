@@ -85,18 +85,12 @@ python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
   `--quantized`). Use `--vocab-size` to override when using added tokens
 - **GPU memory capacity line** (`--gpu`) — draws a dim red horizontal line at the
   GPU's max memory. Supports H100, A100, H200, A10G, L40S, V100, RTX 4090
-- **Annotation de-overlapping** — dense annotation labels are staggered across
-  multiple rows to stay readable. End-marker lines show `name [end]` labels
 - **Annotation context** — tooltips and the bottom mode line show the most recent
   annotation at the current time position
-- **Zoom-aware time axis** — X axis ticks, tooltips, and mode line adapt their
-  precision to the zoom level (e.g., `4m32.1234s` instead of `4.5m`)
 - **Annotation filtering** — auto-hides PyTorch dynamo/inductor internal
   annotations (CompiledFxGraph, pad_mm_benchmark, etc.), showing only
   user-defined markers by default
 - **Gzip support** — loads `.pickle.gz` files directly
-- **Window title** — shows the snapshot filename
-- **FPS counter** — displayed in the header bar
 - **JSON caching** — pickle-to-JSON conversion is cached; subsequent runs skip
   Python extraction if the JSON is newer than the pickle
 
