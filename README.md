@@ -36,6 +36,15 @@ python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
 # Also show 4-bit and int8 factorizations (for quantized models)
 ./target/release/desktop-memory-viz snapshot.pickle --model google/gemma-3-4b-it --quantized
 
+# Override vocab size (e.g., when using added tokens)
+./target/release/desktop-memory-viz snapshot.pickle --model google/gemma-3-27b-it --vocab-size 262200
+
+# Show GPU memory capacity line
+./target/release/desktop-memory-viz snapshot.pickle --gpu h100
+
+# Load gzip-compressed pickle files directly
+./target/release/desktop-memory-viz snapshot.pickle.gz
+
 # Filter annotations to a specific pattern
 ./target/release/desktop-memory-viz snapshot.pickle --annotation-filter "grpo"
 
@@ -56,7 +65,7 @@ python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
 | Click | Pin allocation to bottom bar (persists while navigating) |
 | Click empty space | Unpin |
 | Right-click | Dismiss tooltip (keeps highlight outline) |
-| Ctrl+C | Copy stack trace of pinned/hovered allocation |
+| Cmd+C (macOS) / Ctrl+C | Copy stack trace of pinned/hovered allocation |
 
 ## Features
 
@@ -71,12 +80,22 @@ python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
   tensor shape factorizations, and total memory at allocation/deallocation
 - **Tensor shape display** (`--model`) — fetches `config.json` from HuggingFace
   (supports gated models via `~/.cache/huggingface/token` or `$HF_TOKEN`) and
-  shows tensor sizes as factorizations of `hidden_size` (H) and
-  `intermediate_size` (I) across dtypes (bf16, fp32; also 4-bit, int8 with
-  `--quantized`)
+  shows tensor sizes as factorizations of `hidden_size` (h), `intermediate_size`
+  (i), and `vocab_size` (v) across dtypes (bf16, fp32; also 4-bit, int8 with
+  `--quantized`). Use `--vocab-size` to override when using added tokens
+- **GPU memory capacity line** (`--gpu`) — draws a dim red horizontal line at the
+  GPU's max memory. Supports H100, A100, H200, A10G, L40S, V100, RTX 4090
+- **Annotation de-overlapping** — dense annotation labels are staggered across
+  multiple rows to stay readable. End-marker lines show `name [end]` labels
+- **Annotation context** — tooltips and the bottom mode line show the most recent
+  annotation at the current time position
+- **Zoom-aware time axis** — X axis ticks, tooltips, and mode line adapt their
+  precision to the zoom level (e.g., `4m32.1234s` instead of `4.5m`)
 - **Annotation filtering** — auto-hides PyTorch dynamo/inductor internal
   annotations (CompiledFxGraph, pad_mm_benchmark, etc.), showing only
   user-defined markers by default
+- **Gzip support** — loads `.pickle.gz` files directly
+- **Window title** — shows the snapshot filename
 - **FPS counter** — displayed in the header bar
 - **JSON caching** — pickle-to-JSON conversion is cached; subsequent runs skip
   Python extraction if the JSON is newer than the pickle
