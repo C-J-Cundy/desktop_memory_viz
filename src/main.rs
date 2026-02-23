@@ -45,6 +45,10 @@ struct Cli {
     /// Show 4-bit and int8 factorizations in tooltip (off by default)
     #[arg(long)]
     quantized: bool,
+
+    /// GPU model for showing memory capacity line (e.g., "H100", "H100-80", "A100-80", "A100-40")
+    #[arg(long)]
+    gpu: Option<String>,
 }
 
 // ── Model config (fetched from HuggingFace) ─────────────────────────
@@ -890,6 +894,10 @@ struct MemoryVizApp {
     // Show quantized dtype factorizations (4-bit, int8)
     show_quantized: bool,
 
+    // GPU memory capacity in bytes (for drawing capacity line)
+    gpu_capacity_bytes: Option<f64>,
+    gpu_label: Option<String>,
+
     // FPS counter
     last_frame_time: std::time::Instant,
     fps_smooth: f64,
@@ -914,11 +922,38 @@ struct DragSelect {
 }
 
 impl MemoryVizApp {
-    fn new(layout: PolygonLayout, model_config: Option<ModelConfig>, show_quantized: bool) -> Self {
+    fn new(
+        layout: PolygonLayout,
+        model_config: Option<ModelConfig>,
+        show_quantized: bool,
+        gpu: Option<String>,
+    ) -> Self {
         let view_x_min_us = layout.time_min_us as f64;
         let view_x_max_us = layout.time_max_us as f64;
         let view_y_min_bytes = 0.0;
         let view_y_max_bytes = layout.peak_bytes as f64 * 1.05;
+
+        let (gpu_capacity_bytes, gpu_label) = match gpu.as_deref() {
+            Some(g) => {
+                let capacity: Option<f64> = match g.to_uppercase().as_str() {
+                    "H100" | "H100-80" => Some(80.0 * 1e9),
+                    "A100" | "A100-80" => Some(80.0 * 1e9),
+                    "A100-40" => Some(40.0 * 1e9),
+                    "H200" => Some(141.0 * 1e9),
+                    "A10G" => Some(24.0 * 1e9),
+                    "L40S" => Some(48.0 * 1e9),
+                    "V100" | "V100-32" => Some(32.0 * 1e9),
+                    "V100-16" => Some(16.0 * 1e9),
+                    "4090" | "RTX4090" => Some(24.0 * 1e9),
+                    _ => {
+                        eprintln!("Warning: unknown GPU '{}', no capacity line will be shown", g);
+                        None
+                    }
+                };
+                (capacity, capacity.map(|_| g.to_string()))
+            }
+            None => (None, None),
+        };
 
         MemoryVizApp {
             layout,
@@ -937,6 +972,8 @@ impl MemoryVizApp {
             dismissed_rect_idx: u32::MAX,
             model_config,
             show_quantized,
+            gpu_capacity_bytes,
+            gpu_label,
             last_frame_time: std::time::Instant::now(),
             fps_smooth: 0.0,
         }
@@ -1626,6 +1663,30 @@ impl eframe::App for MemoryVizApp {
                 egui::StrokeKind::Outside,
             );
 
+            // GPU memory capacity line
+            if let Some(capacity) = self.gpu_capacity_bytes {
+                let cap_y = bytes_to_screen_y(capacity);
+                if cap_y >= chart_rect.min.y && cap_y <= chart_rect.max.y {
+                    let cap_color = egui::Color32::from_rgba_premultiplied(200, 50, 50, 140);
+                    painter.line_segment(
+                        [
+                            egui::pos2(chart_rect.min.x, cap_y),
+                            egui::pos2(chart_rect.max.x, cap_y),
+                        ],
+                        egui::Stroke::new(1.5, cap_color),
+                    );
+                    if let Some(ref label) = self.gpu_label {
+                        painter.text(
+                            egui::pos2(chart_rect.max.x - 4.0, cap_y - 2.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!("{} max: {}", label, Self::format_bytes(capacity)),
+                            egui::FontId::proportional(10.0),
+                            cap_color,
+                        );
+                    }
+                }
+            }
+
             // Helper: draw polygon outline for a given rect_idx
             let draw_poly_outline =
                 |painter: &egui::Painter, layout: &PolygonLayout, ri: usize, color: egui::Color32, width: f32| {
@@ -2133,7 +2194,7 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let app = MemoryVizApp::new(layout, model_config, cli.quantized);
+    let app = MemoryVizApp::new(layout, model_config, cli.quantized, cli.gpu);
 
     eframe::run_native(
         "desktop-memory-viz",
