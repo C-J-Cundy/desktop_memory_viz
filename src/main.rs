@@ -99,10 +99,36 @@ fn fetch_model_config(model_id: &str) -> Result<ModelConfig> {
     let intermediate_size = text_cfg["intermediate_size"]
         .as_u64()
         .context("config.json missing intermediate_size")? as usize;
-    let vocab_size = config["vocab_size"]
+    let mut vocab_size = config["vocab_size"]
         .as_u64()
         .or_else(|| text_cfg["vocab_size"].as_u64())
         .unwrap_or(0) as usize;
+
+    // Fallback: fetch tokenizer.json and count vocab entries
+    if vocab_size == 0 {
+        let tok_url = format!(
+            "https://huggingface.co/{}/resolve/main/tokenizer.json",
+            model_id
+        );
+        eprintln!("  vocab_size not in config.json, trying tokenizer.json...");
+        let mut tok_req = ureq::get(&tok_url);
+        if let Some(ref tok) = token {
+            tok_req = tok_req.header("Authorization", &format!("Bearer {}", tok));
+        }
+        if let Ok(mut resp) = tok_req.call() {
+            if let Ok(tok_body) = resp.body_mut().read_to_string() {
+                if let Ok(tok_json) = serde_json::from_str::<serde_json::Value>(&tok_body) {
+                    if let Some(vocab) = tok_json.get("model").and_then(|m| m.get("vocab")) {
+                        if let Some(obj) = vocab.as_object() {
+                            vocab_size = obj.len();
+                        } else if let Some(arr) = vocab.as_array() {
+                            vocab_size = arr.len();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     eprintln!(
         "  Model: {} | hidden_size={} | intermediate_size={} | vocab_size={}",
