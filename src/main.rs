@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Override vocab size (e.g., when using added tokens)
+    #[arg(long)]
+    vocab_size: Option<usize>,
+
     /// Show 4-bit and int8 factorizations in tooltip (off by default)
     #[arg(long)]
     quantized: bool,
@@ -2100,7 +2104,13 @@ fn main() -> Result<()> {
     // Fetch model config from HuggingFace if --model is provided
     let model_config = match &cli.model {
         Some(model_id) => match fetch_model_config(model_id) {
-            Ok(cfg) => Some(cfg),
+            Ok(mut cfg) => {
+                if let Some(v) = cli.vocab_size {
+                    eprintln!("  Overriding vocab_size: {} -> {}", cfg.vocab_size, v);
+                    cfg.vocab_size = v;
+                }
+                Some(cfg)
+            }
             Err(e) => {
                 eprintln!("Warning: failed to fetch model config: {}", e);
                 None
