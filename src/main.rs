@@ -1307,9 +1307,11 @@ impl eframe::App for MemoryVizApp {
                             );
                         }
                         if is_pinned {
-                            ui.label("| [pinned] Click empty to unpin | Ctrl+C to copy");
+                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                            ui.label(format!("| [pinned] Click empty to unpin | {} to copy", copy_hint));
                         } else {
-                            ui.label("| Click to pin | Ctrl+C to copy");
+                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                            ui.label(format!("| Click to pin | {} to copy", copy_hint));
                         }
                     });
                     if !info.frame_str.is_empty() {
@@ -1324,7 +1326,8 @@ impl eframe::App for MemoryVizApp {
                         });
                     }
                 } else {
-                    ui.label("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, Ctrl+C=copy.");
+                    let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
