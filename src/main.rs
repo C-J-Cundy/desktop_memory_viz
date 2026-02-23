@@ -50,6 +50,7 @@ struct ModelConfig {
     model_id: String,
     hidden_size: usize,
     intermediate_size: usize,
+    vocab_size: usize,
 }
 
 /// Fetch config.json from HuggingFace and extract hidden/intermediate sizes.
@@ -98,16 +99,21 @@ fn fetch_model_config(model_id: &str) -> Result<ModelConfig> {
     let intermediate_size = text_cfg["intermediate_size"]
         .as_u64()
         .context("config.json missing intermediate_size")? as usize;
+    let vocab_size = config["vocab_size"]
+        .as_u64()
+        .or_else(|| text_cfg["vocab_size"].as_u64())
+        .unwrap_or(0) as usize;
 
     eprintln!(
-        "  Model: {} | hidden_size={} | intermediate_size={}",
-        model_id, hidden_size, intermediate_size
+        "  Model: {} | hidden_size={} | intermediate_size={} | vocab_size={}",
+        model_id, hidden_size, intermediate_size, vocab_size
     );
 
     Ok(ModelConfig {
         model_id: model_id.to_string(),
         hidden_size,
         intermediate_size,
+        vocab_size,
     })
 }
 
@@ -957,6 +963,7 @@ impl MemoryVizApp {
         let cfg = self.model_config.as_ref()?;
         let h = cfg.hidden_size as u64;
         let i = cfg.intermediate_size as u64;
+        let v = cfg.vocab_size as u64;
         if h == 0 {
             return None;
         }
@@ -988,7 +995,7 @@ impl MemoryVizApp {
             }
 
             // Try factorizations, most specific first
-            if let Some(desc) = Self::try_factor(elements, h, i) {
+            if let Some(desc) = Self::try_factor(elements, h, i, v) {
                 results.push(format!("{}: {}", dtype_label, desc));
             }
         }
@@ -1000,9 +1007,18 @@ impl MemoryVizApp {
         }
     }
 
-    /// Try to factor `elements` as products of hidden_size (h) and intermediate_size (i).
-    /// Returns the most informative description.
-    fn try_factor(elements: u64, h: u64, i: u64) -> Option<String> {
+    /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
+    /// and vocab_size (v). Returns the most informative description.
+    fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
+        // v x h (embedding / lm_head)
+        if v > 0 && h > 0 && elements % (v * h) == 0 {
+            let n = elements / (v * h);
+            if n == 1 {
+                return Some("v x h".to_string());
+            }
+            return Some(format!("{} x v x h", n));
+        }
+
         // h x i or i x h
         if h > 0 && i > 0 && elements % (h * i) == 0 {
             let n = elements / (h * i);
@@ -1021,6 +1037,15 @@ impl MemoryVizApp {
             return Some(format!("{} x h x h", n));
         }
 
+        // v x i
+        if v > 0 && i > 0 && elements % (v * i) == 0 {
+            let n = elements / (v * i);
+            if n == 1 {
+                return Some("v x i".to_string());
+            }
+            return Some(format!("{} x v x i", n));
+        }
+
         // i x i (less common but possible)
         if i > 0 && i != h && elements % (i * i) == 0 {
             let n = elements / (i * i);
@@ -1028,6 +1053,15 @@ impl MemoryVizApp {
                 return Some("i x i".to_string());
             }
             return Some(format!("{} x i x i", n));
+        }
+
+        // N x v
+        if v > 0 && v != h && v != i && elements % v == 0 {
+            let n = elements / v;
+            if n == 1 {
+                return Some("[v]".to_string());
+            }
+            return Some(format!("{} x v", n));
         }
 
         // N x i
