@@ -114,7 +114,13 @@ torch.cuda.memory._record_memory_history(
 )
 
 # ... your training code here ...
-# Annotate phases of training so they show up as labeled vertical lines:
+# Annotate phases of training so they show up as labeled vertical lines.
+
+# Stand-alone annotation: marks a single point in time.
+torch.cuda.memory.record_annotation("## checkpoint_saved ##")
+
+# Context manager: draws a start line and a matching end line,
+# so you can see exactly how long a phase lasted.
 with torch.cuda.memory.record_annotation("## forward_pass ##"):
     output = model(input_ids)
 with torch.cuda.memory.record_annotation("## backward ##"):
