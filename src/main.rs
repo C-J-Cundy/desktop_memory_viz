@@ -1098,7 +1098,14 @@ impl MemoryVizApp {
         if idx == 0 {
             return None;
         }
-        Some(&anns[idx - 1])
+        let ann = &anns[idx - 1];
+        // Don't show if we've gone past the end of a paired annotation
+        if let Some(end_us) = ann.end_us {
+            if time_us > end_us {
+                return None;
+            }
+        }
+        Some(ann)
     }
 }
 
