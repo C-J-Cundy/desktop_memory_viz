@@ -1410,8 +1410,9 @@ impl eframe::App for MemoryVizApp {
                             );
                         }
                         ui.label(format!(
-                            "| At alloc: {} | At dealloc: {}",
+                            "| Before alloc: {} | After alloc: {} | At dealloc: {}",
                             Self::format_bytes(info.total_allocated_bytes as f64),
+                            Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64),
                             Self::format_bytes(info.total_at_dealloc_bytes as f64),
                         ));
                         if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
@@ -1868,8 +1869,12 @@ impl eframe::App for MemoryVizApp {
                                 );
                             }
                             ui.label(format!(
-                                "Total at allocation: {}",
+                                "Total before allocation: {}",
                                 Self::format_bytes(info.total_allocated_bytes as f64)
+                            ));
+                            ui.label(format!(
+                                "Total after allocation: {}",
+                                Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64)
                             ));
                             if info.total_at_dealloc_bytes > 0 {
                                 ui.label(format!(
