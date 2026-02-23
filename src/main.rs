@@ -1964,7 +1964,10 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
-            .with_title("CUDA Memory Timeline"),
+            .with_title(format!(
+                "CUDA Memory Timeline — {}",
+                cli.input.file_name().map(|f| f.to_string_lossy()).unwrap_or_default()
+            )),
         ..Default::default()
     };
 
