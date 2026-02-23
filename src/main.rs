@@ -134,6 +134,20 @@ fn fetch_model_config(model_id: &str) -> Result<ModelConfig> {
         }
     }
 
+    // Gemma 3 models have vocab_size=262145 but this isn't in config.json and
+    // tokenizer.json reports 262144. Hardcode the correct value.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if model_type.starts_with("gemma3") && vocab_size != 262145 {
+        eprintln!(
+            "  Warning: Gemma 3 detected (model_type={}), overriding vocab_size {} -> 262145",
+            model_type, vocab_size
+        );
+        vocab_size = 262145;
+    }
+
     eprintln!(
         "  Model: {} | hidden_size={} | intermediate_size={} | vocab_size={}",
         model_id, hidden_size, intermediate_size, vocab_size
