@@ -100,6 +100,41 @@ python3 extract_snapshot.py snapshot.pickle snapshot.extracted.json
 - **JSON caching** — pickle-to-JSON conversion is cached; subsequent runs skip
   Python extraction if the JSON is newer than the pickle
 
+## Capturing a memory snapshot
+
+Add the following to your training script to record a CUDA memory snapshot:
+
+```python
+import torch
+
+# Start recording BEFORE any GPU operations (model loading, optimizer init, etc.)
+torch.cuda.memory._record_memory_history(
+    stacks="python",                # capture Python stack traces
+    global_record_annotations=True, # capture user annotations (## markers ##)
+)
+
+# ... your training code here ...
+# Use torch.cuda.record_annotation("## step_name ##") or
+# the context manager to annotate phases of training.
+
+# Save the snapshot after training (or at OOM, in a signal handler, etc.)
+torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+torch.cuda.memory._record_memory_history(enabled=None)  # stop recording
+```
+
+For best results:
+
+- **Start recording early** — call `_record_memory_history()` before creating
+  models, optimizers, or any CUDA tensors so the snapshot captures the full
+  timeline from the start.
+- **Use `expandable_segments`** — set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  to reduce fragmentation and make the timeline easier to read.
+- **Add annotations** — wrap training phases with `## name ##` annotations so
+  they show up as labeled vertical lines in the visualizer.
+- **Free memory before saving** — delete models and call `torch.cuda.empty_cache()`
+  before dumping so the trace shows memory returning to zero, which helps verify
+  there are no leaks.
+
 ## Performance
 
 On a 490 MB pickle (Gemma 4B, 2.7M events, 926K allocations):
