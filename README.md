@@ -114,21 +114,25 @@ torch.cuda.memory._record_memory_history(
 )
 
 # ... your training code here ...
-# Use torch.cuda.record_annotation("## step_name ##") or
-# the context manager to annotate phases of training.
+# Annotate phases of training so they show up as labeled vertical lines:
+with torch.cuda.memory.record_annotation("## forward_pass ##"):
+    output = model(input_ids)
+with torch.cuda.memory.record_annotation("## backward ##"):
+    loss.backward()
 
 # Save the snapshot after training (or at OOM, in a signal handler, etc.)
 torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
 torch.cuda.memory._record_memory_history(enabled=None)  # stop recording
 ```
 
-For best results:
+Recommendations:
 
 - **Start recording early** — call `_record_memory_history()` before creating
   models, optimizers, or any CUDA tensors so the snapshot captures the full
   timeline from the start.
-- **Use `expandable_segments`** — set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-  to reduce fragmentation and make the timeline easier to read.
+- **Consider `expandable_segments`** — set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  to reduce fragmentation and make the timeline easier to read. Note this may
+  have a small performance hit.
 - **Add annotations** — wrap training phases with `## name ##` annotations so
   they show up as labeled vertical lines in the visualizer.
 - **Free memory before saving** — delete models and call `torch.cuda.empty_cache()`
