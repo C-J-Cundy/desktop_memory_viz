@@ -1075,6 +1075,65 @@ impl MemoryVizApp {
         }
     }
 
+    /// Format a time value for axis ticks, choosing unit and precision based on
+    /// the visible tick spacing so that adjacent ticks show distinct values.
+    fn format_axis_time_us(us: f64, tick_spacing_us: f64) -> String {
+        if tick_spacing_us < 1.0 {
+            // Sub-microsecond spacing: show fractional microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.6}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.6}s", sec)
+            }
+        } else if tick_spacing_us < 1e3 {
+            // Microsecond scale
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.4}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.4}s", sec)
+            }
+        } else if tick_spacing_us < 1e4 {
+            // Tens of microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.3}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.3}s", sec)
+            }
+        } else if tick_spacing_us < 1e5 {
+            // Hundreds of microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.2}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.2}s", sec)
+            }
+        } else if tick_spacing_us < 1e6 {
+            // Millisecond scale
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.1}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.1}s", sec)
+            }
+        } else {
+            // Seconds or minutes scale — use default formatter
+            Self::format_time_us(us)
+        }
+    }
+
     fn format_duration_us(us: f64) -> String {
         if us >= 1e6 * 60.0 {
             format!("{:.1}m", us / 1e6 / 60.0)
@@ -1098,7 +1157,14 @@ impl MemoryVizApp {
         if idx == 0 {
             return None;
         }
-        Some(&anns[idx - 1])
+        let ann = &anns[idx - 1];
+        // Don't show if we've gone past the end of a paired annotation
+        if let Some(end_us) = ann.end_us {
+            if time_us > end_us {
+                return None;
+            }
+        }
+        Some(ann)
     }
 }
 
@@ -1173,8 +1239,8 @@ impl eframe::App for MemoryVizApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "View: {} - {} | {} - {}",
-                        Self::format_time_us(self.view_x_min_us - self.layout.time_min_us as f64),
-                        Self::format_time_us(self.view_x_max_us - self.layout.time_min_us as f64),
+                        Self::format_axis_time_us(self.view_x_min_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_max_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                         Self::format_bytes(self.view_y_min_bytes),
                         Self::format_bytes(self.view_y_max_bytes),
                     ));
@@ -1218,8 +1284,8 @@ impl eframe::App for MemoryVizApp {
                         );
                         ui.label(format!(
                             "| {} - {} | Duration: {}",
-                            Self::format_time_us(info.start_us as f64 - time_min_us),
-                            Self::format_time_us(info.end_us as f64 - time_min_us),
+                            Self::format_axis_time_us(info.start_us as f64 - time_min_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                            Self::format_axis_time_us(info.end_us as f64 - time_min_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                             Self::format_duration_us((info.end_us - info.start_us) as f64),
                         ));
                         if let Some(shape) = &shape_str {
@@ -1241,9 +1307,11 @@ impl eframe::App for MemoryVizApp {
                             );
                         }
                         if is_pinned {
-                            ui.label("| [pinned] Click empty to unpin | Ctrl+C to copy");
+                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                            ui.label(format!("| [pinned] Click empty to unpin | {} to copy", copy_hint));
                         } else {
-                            ui.label("| Click to pin | Ctrl+C to copy");
+                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                            ui.label(format!("| Click to pin | {} to copy", copy_hint));
                         }
                     });
                     if !info.frame_str.is_empty() {
@@ -1258,7 +1326,8 @@ impl eframe::App for MemoryVizApp {
                         });
                     }
                 } else {
-                    ui.label("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, Ctrl+C=copy.");
+                    let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1331,6 +1400,7 @@ impl eframe::App for MemoryVizApp {
                     egui::Color32::from_rgb(136, 136, 136),
                 );
             }
+            let tick_spacing_us = x_range / 10.0;
             for i in 0..=10 {
                 let frac = i as f32 / 10.0;
                 let x = chart_rect.min.x + frac * chart_width;
@@ -1346,7 +1416,7 @@ impl eframe::App for MemoryVizApp {
                 painter.text(
                     egui::pos2(x, chart_rect.max.y + 6.0),
                     egui::Align2::CENTER_TOP,
-                    Self::format_time_us(relative),
+                    Self::format_axis_time_us(relative, tick_spacing_us),
                     egui::FontId::monospace(10.0),
                     egui::Color32::from_rgb(136, 136, 136),
                 );
@@ -1640,13 +1710,16 @@ impl eframe::App for MemoryVizApp {
                                 "Duration: {}",
                                 Self::format_duration_us((info.end_us - info.start_us) as f64)
                             ));
+                            let tick_sp = (self.view_x_max_us - self.view_x_min_us) / 10.0;
                             ui.label(format!(
                                 "Time: {} - {}",
-                                Self::format_time_us(
-                                    info.start_us as f64 - self.layout.time_min_us as f64
+                                Self::format_axis_time_us(
+                                    info.start_us as f64 - self.layout.time_min_us as f64,
+                                    tick_sp,
                                 ),
-                                Self::format_time_us(
-                                    info.end_us as f64 - self.layout.time_min_us as f64
+                                Self::format_axis_time_us(
+                                    info.end_us as f64 - self.layout.time_min_us as f64,
+                                    tick_sp,
                                 ),
                             ));
                             if let Some(shape) = self.format_tensor_shape(info.size_bytes) {
@@ -1678,7 +1751,7 @@ impl eframe::App for MemoryVizApp {
                         egui::show_tooltip_at_pointer(ctx, response.layer_id, egui::Id::new("cursor_tooltip"), |ui| {
                             ui.label(format!(
                                 "t = {} | mem = {}",
-                                Self::format_time_us(rel_us),
+                                Self::format_axis_time_us(rel_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                                 Self::format_bytes(hover_bytes),
                             ));
                             if let Some(ann) = self.find_annotation_at(hover_us) {
@@ -1957,7 +2030,10 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
-            .with_title("CUDA Memory Timeline"),
+            .with_title(format!(
+                "CUDA Memory Timeline — {}",
+                cli.input.file_name().map(|f| f.to_string_lossy()).unwrap_or_default()
+            )),
         ..Default::default()
     };
 
