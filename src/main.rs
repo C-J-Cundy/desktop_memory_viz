@@ -1075,6 +1075,65 @@ impl MemoryVizApp {
         }
     }
 
+    /// Format a time value for axis ticks, choosing unit and precision based on
+    /// the visible tick spacing so that adjacent ticks show distinct values.
+    fn format_axis_time_us(us: f64, tick_spacing_us: f64) -> String {
+        if tick_spacing_us < 1.0 {
+            // Sub-microsecond spacing: show fractional microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.6}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.6}s", sec)
+            }
+        } else if tick_spacing_us < 1e3 {
+            // Microsecond scale
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.4}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.4}s", sec)
+            }
+        } else if tick_spacing_us < 1e4 {
+            // Tens of microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.3}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.3}s", sec)
+            }
+        } else if tick_spacing_us < 1e5 {
+            // Hundreds of microseconds
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.2}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.2}s", sec)
+            }
+        } else if tick_spacing_us < 1e6 {
+            // Millisecond scale
+            let sec = us / 1e6;
+            let minutes = (sec / 60.0).floor();
+            let remainder_s = sec - minutes * 60.0;
+            if minutes >= 1.0 {
+                format!("{}m{:.1}s", minutes as i64, remainder_s)
+            } else {
+                format!("{:.1}s", sec)
+            }
+        } else {
+            // Seconds or minutes scale — use default formatter
+            Self::format_time_us(us)
+        }
+    }
+
     fn format_duration_us(us: f64) -> String {
         if us >= 1e6 * 60.0 {
             format!("{:.1}m", us / 1e6 / 60.0)
@@ -1338,6 +1397,7 @@ impl eframe::App for MemoryVizApp {
                     egui::Color32::from_rgb(136, 136, 136),
                 );
             }
+            let tick_spacing_us = x_range / 10.0;
             for i in 0..=10 {
                 let frac = i as f32 / 10.0;
                 let x = chart_rect.min.x + frac * chart_width;
@@ -1353,7 +1413,7 @@ impl eframe::App for MemoryVizApp {
                 painter.text(
                     egui::pos2(x, chart_rect.max.y + 6.0),
                     egui::Align2::CENTER_TOP,
-                    Self::format_time_us(relative),
+                    Self::format_axis_time_us(relative, tick_spacing_us),
                     egui::FontId::monospace(10.0),
                     egui::Color32::from_rgb(136, 136, 136),
                 );
