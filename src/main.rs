@@ -1239,8 +1239,8 @@ impl eframe::App for MemoryVizApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "View: {} - {} | {} - {}",
-                        Self::format_time_us(self.view_x_min_us - self.layout.time_min_us as f64),
-                        Self::format_time_us(self.view_x_max_us - self.layout.time_min_us as f64),
+                        Self::format_axis_time_us(self.view_x_min_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_max_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                         Self::format_bytes(self.view_y_min_bytes),
                         Self::format_bytes(self.view_y_max_bytes),
                     ));
@@ -1284,8 +1284,8 @@ impl eframe::App for MemoryVizApp {
                         );
                         ui.label(format!(
                             "| {} - {} | Duration: {}",
-                            Self::format_time_us(info.start_us as f64 - time_min_us),
-                            Self::format_time_us(info.end_us as f64 - time_min_us),
+                            Self::format_axis_time_us(info.start_us as f64 - time_min_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                            Self::format_axis_time_us(info.end_us as f64 - time_min_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                             Self::format_duration_us((info.end_us - info.start_us) as f64),
                         ));
                         if let Some(shape) = &shape_str {
@@ -1707,13 +1707,16 @@ impl eframe::App for MemoryVizApp {
                                 "Duration: {}",
                                 Self::format_duration_us((info.end_us - info.start_us) as f64)
                             ));
+                            let tick_sp = (self.view_x_max_us - self.view_x_min_us) / 10.0;
                             ui.label(format!(
                                 "Time: {} - {}",
-                                Self::format_time_us(
-                                    info.start_us as f64 - self.layout.time_min_us as f64
+                                Self::format_axis_time_us(
+                                    info.start_us as f64 - self.layout.time_min_us as f64,
+                                    tick_sp,
                                 ),
-                                Self::format_time_us(
-                                    info.end_us as f64 - self.layout.time_min_us as f64
+                                Self::format_axis_time_us(
+                                    info.end_us as f64 - self.layout.time_min_us as f64,
+                                    tick_sp,
                                 ),
                             ));
                             if let Some(shape) = self.format_tensor_shape(info.size_bytes) {
@@ -1745,7 +1748,7 @@ impl eframe::App for MemoryVizApp {
                         egui::show_tooltip_at_pointer(ctx, response.layer_id, egui::Id::new("cursor_tooltip"), |ui| {
                             ui.label(format!(
                                 "t = {} | mem = {}",
-                                Self::format_time_us(rel_us),
+                                Self::format_axis_time_us(rel_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                                 Self::format_bytes(hover_bytes),
                             ));
                             if let Some(ann) = self.find_annotation_at(hover_us) {
