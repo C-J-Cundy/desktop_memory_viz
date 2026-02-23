@@ -17,6 +17,7 @@ Events include addr for pairing alloc/free events, and frame_idx indexes into
 the deduplicated frame_strings array.
 """
 
+import gzip
 import json
 import pickle
 import sys
@@ -55,7 +56,8 @@ def main():
 
     t0 = time.time()
     print(f"Loading {input_path}...", file=sys.stderr)
-    with open(input_path, "rb") as f:
+    opener = gzip.open if input_path.endswith(".gz") else open
+    with opener(input_path, "rb") as f:
         data = pickle.load(f)
     print(f"  Loaded in {time.time() - t0:.1f}s", file=sys.stderr)
 

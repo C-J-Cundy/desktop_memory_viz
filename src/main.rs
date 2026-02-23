@@ -38,9 +38,17 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Override vocab size (e.g., when using added tokens)
+    #[arg(long)]
+    vocab_size: Option<usize>,
+
     /// Show 4-bit and int8 factorizations in tooltip (off by default)
     #[arg(long)]
     quantized: bool,
+
+    /// GPU model for showing memory capacity line (e.g., "H100", "H100-80", "A100-80", "A100-40")
+    #[arg(long)]
+    gpu: Option<String>,
 }
 
 // ── Model config (fetched from HuggingFace) ─────────────────────────
@@ -50,6 +58,7 @@ struct ModelConfig {
     model_id: String,
     hidden_size: usize,
     intermediate_size: usize,
+    vocab_size: usize,
 }
 
 /// Fetch config.json from HuggingFace and extract hidden/intermediate sizes.
@@ -98,16 +107,61 @@ fn fetch_model_config(model_id: &str) -> Result<ModelConfig> {
     let intermediate_size = text_cfg["intermediate_size"]
         .as_u64()
         .context("config.json missing intermediate_size")? as usize;
+    let mut vocab_size = config["vocab_size"]
+        .as_u64()
+        .or_else(|| text_cfg["vocab_size"].as_u64())
+        .unwrap_or(0) as usize;
+
+    // Fallback: fetch tokenizer.json and count vocab entries
+    if vocab_size == 0 {
+        let tok_url = format!(
+            "https://huggingface.co/{}/resolve/main/tokenizer.json",
+            model_id
+        );
+        eprintln!("  vocab_size not in config.json, trying tokenizer.json...");
+        let mut tok_req = ureq::get(&tok_url);
+        if let Some(ref tok) = token {
+            tok_req = tok_req.header("Authorization", &format!("Bearer {}", tok));
+        }
+        if let Ok(mut resp) = tok_req.call() {
+            if let Ok(tok_body) = resp.body_mut().read_to_string() {
+                if let Ok(tok_json) = serde_json::from_str::<serde_json::Value>(&tok_body) {
+                    if let Some(vocab) = tok_json.get("model").and_then(|m| m.get("vocab")) {
+                        if let Some(obj) = vocab.as_object() {
+                            vocab_size = obj.len();
+                        } else if let Some(arr) = vocab.as_array() {
+                            vocab_size = arr.len();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Gemma 3 models have vocab_size=262145 but this isn't in config.json and
+    // tokenizer.json reports 262144. Hardcode the correct value.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if model_type.starts_with("gemma3") && vocab_size != 262145 {
+        eprintln!(
+            "  Warning: Gemma 3 detected (model_type={}), overriding vocab_size {} -> 262145",
+            model_type, vocab_size
+        );
+        vocab_size = 262145;
+    }
 
     eprintln!(
-        "  Model: {} | hidden_size={} | intermediate_size={}",
-        model_id, hidden_size, intermediate_size
+        "  Model: {} | hidden_size={} | intermediate_size={} | vocab_size={}",
+        model_id, hidden_size, intermediate_size, vocab_size
     );
 
     Ok(ModelConfig {
         model_id: model_id.to_string(),
         hidden_size,
         intermediate_size,
+        vocab_size,
     })
 }
 
@@ -840,6 +894,10 @@ struct MemoryVizApp {
     // Show quantized dtype factorizations (4-bit, int8)
     show_quantized: bool,
 
+    // GPU memory capacity in bytes (for drawing capacity line)
+    gpu_capacity_bytes: Option<f64>,
+    gpu_label: Option<String>,
+
     // FPS counter
     last_frame_time: std::time::Instant,
     fps_smooth: f64,
@@ -864,11 +922,38 @@ struct DragSelect {
 }
 
 impl MemoryVizApp {
-    fn new(layout: PolygonLayout, model_config: Option<ModelConfig>, show_quantized: bool) -> Self {
+    fn new(
+        layout: PolygonLayout,
+        model_config: Option<ModelConfig>,
+        show_quantized: bool,
+        gpu: Option<String>,
+    ) -> Self {
         let view_x_min_us = layout.time_min_us as f64;
         let view_x_max_us = layout.time_max_us as f64;
         let view_y_min_bytes = 0.0;
         let view_y_max_bytes = layout.peak_bytes as f64 * 1.05;
+
+        let (gpu_capacity_bytes, gpu_label) = match gpu.as_deref() {
+            Some(g) => {
+                let capacity: Option<f64> = match g.to_uppercase().as_str() {
+                    "H100" | "H100-80" => Some(80.0 * 1e9),
+                    "A100" | "A100-80" => Some(80.0 * 1e9),
+                    "A100-40" => Some(40.0 * 1e9),
+                    "H200" => Some(141.0 * 1e9),
+                    "A10G" => Some(24.0 * 1e9),
+                    "L40S" => Some(48.0 * 1e9),
+                    "V100" | "V100-32" => Some(32.0 * 1e9),
+                    "V100-16" => Some(16.0 * 1e9),
+                    "4090" | "RTX4090" => Some(24.0 * 1e9),
+                    _ => {
+                        eprintln!("Warning: unknown GPU '{}', no capacity line will be shown", g);
+                        None
+                    }
+                };
+                (capacity, capacity.map(|_| g.to_string()))
+            }
+            None => (None, None),
+        };
 
         MemoryVizApp {
             layout,
@@ -887,6 +972,8 @@ impl MemoryVizApp {
             dismissed_rect_idx: u32::MAX,
             model_config,
             show_quantized,
+            gpu_capacity_bytes,
+            gpu_label,
             last_frame_time: std::time::Instant::now(),
             fps_smooth: 0.0,
         }
@@ -957,6 +1044,7 @@ impl MemoryVizApp {
         let cfg = self.model_config.as_ref()?;
         let h = cfg.hidden_size as u64;
         let i = cfg.intermediate_size as u64;
+        let v = cfg.vocab_size as u64;
         if h == 0 {
             return None;
         }
@@ -988,7 +1076,7 @@ impl MemoryVizApp {
             }
 
             // Try factorizations, most specific first
-            if let Some(desc) = Self::try_factor(elements, h, i) {
+            if let Some(desc) = Self::try_factor(elements, h, i, v) {
                 results.push(format!("{}: {}", dtype_label, desc));
             }
         }
@@ -1000,9 +1088,18 @@ impl MemoryVizApp {
         }
     }
 
-    /// Try to factor `elements` as products of hidden_size (h) and intermediate_size (i).
-    /// Returns the most informative description.
-    fn try_factor(elements: u64, h: u64, i: u64) -> Option<String> {
+    /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
+    /// and vocab_size (v). Returns the most informative description.
+    fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
+        // v x h (embedding / lm_head)
+        if v > 0 && h > 0 && elements % (v * h) == 0 {
+            let n = elements / (v * h);
+            if n == 1 {
+                return Some("v x h".to_string());
+            }
+            return Some(format!("{} x v x h", n));
+        }
+
         // h x i or i x h
         if h > 0 && i > 0 && elements % (h * i) == 0 {
             let n = elements / (h * i);
@@ -1021,6 +1118,15 @@ impl MemoryVizApp {
             return Some(format!("{} x h x h", n));
         }
 
+        // v x i
+        if v > 0 && i > 0 && elements % (v * i) == 0 {
+            let n = elements / (v * i);
+            if n == 1 {
+                return Some("v x i".to_string());
+            }
+            return Some(format!("{} x v x i", n));
+        }
+
         // i x i (less common but possible)
         if i > 0 && i != h && elements % (i * i) == 0 {
             let n = elements / (i * i);
@@ -1028,6 +1134,15 @@ impl MemoryVizApp {
                 return Some("i x i".to_string());
             }
             return Some(format!("{} x i x i", n));
+        }
+
+        // N x v
+        if v > 0 && v != h && v != i && elements % v == 0 {
+            let n = elements / v;
+            if n == 1 {
+                return Some("[v]".to_string());
+            }
+            return Some(format!("{} x v", n));
         }
 
         // N x i
@@ -1295,8 +1410,9 @@ impl eframe::App for MemoryVizApp {
                             );
                         }
                         ui.label(format!(
-                            "| At alloc: {} | At dealloc: {}",
+                            "| Before alloc: {} | After alloc: {} | At dealloc: {}",
                             Self::format_bytes(info.total_allocated_bytes as f64),
+                            Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64),
                             Self::format_bytes(info.total_at_dealloc_bytes as f64),
                         ));
                         if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
@@ -1548,6 +1664,30 @@ impl eframe::App for MemoryVizApp {
                 egui::StrokeKind::Outside,
             );
 
+            // GPU memory capacity line
+            if let Some(capacity) = self.gpu_capacity_bytes {
+                let cap_y = bytes_to_screen_y(capacity);
+                if cap_y >= chart_rect.min.y && cap_y <= chart_rect.max.y {
+                    let cap_color = egui::Color32::from_rgba_premultiplied(200, 50, 50, 140);
+                    painter.line_segment(
+                        [
+                            egui::pos2(chart_rect.min.x, cap_y),
+                            egui::pos2(chart_rect.max.x, cap_y),
+                        ],
+                        egui::Stroke::new(1.5, cap_color),
+                    );
+                    if let Some(ref label) = self.gpu_label {
+                        painter.text(
+                            egui::pos2(chart_rect.max.x - 4.0, cap_y - 2.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!("{} max: {}", label, Self::format_bytes(capacity)),
+                            egui::FontId::proportional(10.0),
+                            cap_color,
+                        );
+                    }
+                }
+            }
+
             // Helper: draw polygon outline for a given rect_idx
             let draw_poly_outline =
                 |painter: &egui::Painter, layout: &PolygonLayout, ri: usize, color: egui::Color32, width: f32| {
@@ -1729,8 +1869,12 @@ impl eframe::App for MemoryVizApp {
                                 );
                             }
                             ui.label(format!(
-                                "Total at allocation: {}",
+                                "Total before allocation: {}",
                                 Self::format_bytes(info.total_allocated_bytes as f64)
+                            ));
+                            ui.label(format!(
+                                "Total after allocation: {}",
+                                Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64)
                             ));
                             if info.total_at_dealloc_bytes > 0 {
                                 ui.label(format!(
@@ -2040,7 +2184,13 @@ fn main() -> Result<()> {
     // Fetch model config from HuggingFace if --model is provided
     let model_config = match &cli.model {
         Some(model_id) => match fetch_model_config(model_id) {
-            Ok(cfg) => Some(cfg),
+            Ok(mut cfg) => {
+                if let Some(v) = cli.vocab_size {
+                    eprintln!("  Overriding vocab_size: {} -> {}", cfg.vocab_size, v);
+                    cfg.vocab_size = v;
+                }
+                Some(cfg)
+            }
             Err(e) => {
                 eprintln!("Warning: failed to fetch model config: {}", e);
                 None
@@ -2049,7 +2199,7 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let app = MemoryVizApp::new(layout, model_config, cli.quantized);
+    let app = MemoryVizApp::new(layout, model_config, cli.quantized, cli.gpu);
 
     eframe::run_native(
         "desktop-memory-viz",
