@@ -1635,7 +1635,7 @@ impl eframe::App for MemoryVizApp {
                                 self.pinned_rect_idx = None;
                             }
 
-                            if rect_idx != u32::MAX {
+                            if rect_idx != u32::MAX && self.drag_select.is_none() {
                                 let ri = rect_idx as usize;
                                 let r = &self.layout.rects[ri];
 
