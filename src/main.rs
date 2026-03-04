@@ -860,7 +860,9 @@ struct HoverInfo {
 /// State for cmd+drag region selection
 struct DragSelect {
     start_us: f64,
+    start_bytes: f64,
     start_screen_x: f32,
+    start_screen_y: f32,
 }
 
 impl MemoryVizApp {
@@ -1814,7 +1816,9 @@ impl eframe::App for MemoryVizApp {
                     if chart_rect.contains(pos) {
                         self.drag_select = Some(DragSelect {
                             start_us: screen_x_to_us(pos.x),
+                            start_bytes: screen_y_to_bytes(pos.y),
                             start_screen_x: pos.x,
+                            start_screen_y: pos.y,
                         });
                     }
                 }
@@ -1855,14 +1859,21 @@ impl eframe::App for MemoryVizApp {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     let x_start = sel.start_screen_x.max(chart_rect.min.x).min(chart_rect.max.x);
                     let x_end = pos.x.max(chart_rect.min.x).min(chart_rect.max.x);
+                    let y_start = sel.start_screen_y.max(chart_rect.min.y).min(chart_rect.max.y);
+                    let y_end = pos.y.max(chart_rect.min.y).min(chart_rect.max.y);
                     let (x_left, x_right) = if x_start < x_end {
                         (x_start, x_end)
                     } else {
                         (x_end, x_start)
                     };
+                    let (y_top, y_bottom) = if y_start < y_end {
+                        (y_start, y_end)
+                    } else {
+                        (y_end, y_start)
+                    };
                     let sel_rect = egui::Rect::from_min_max(
-                        egui::pos2(x_left, chart_rect.min.y),
-                        egui::pos2(x_right, chart_rect.max.y),
+                        egui::pos2(x_left, y_top),
+                        egui::pos2(x_right, y_bottom),
                     );
                     painter.rect_filled(
                         sel_rect,
@@ -1886,30 +1897,56 @@ impl eframe::App for MemoryVizApp {
                 if let Some(sel) = self.drag_select.take() {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         let end_us = screen_x_to_us(pos.x);
-                        let (new_min, new_max) = if sel.start_us < end_us {
+                        let end_bytes = screen_y_to_bytes(pos.y);
+                        let (new_x_min, new_x_max) = if sel.start_us < end_us {
                             (sel.start_us, end_us)
                         } else {
                             (end_us, sel.start_us)
                         };
-                        // Only zoom if selection is at least a few pixels wide
+                        let (new_y_min, new_y_max) = if sel.start_bytes < end_bytes {
+                            (sel.start_bytes, end_bytes)
+                        } else {
+                            (end_bytes, sel.start_bytes)
+                        };
+                        // Only zoom if selection is at least a few pixels in both axes
                         let sel_width_px =
-                            ((new_max - new_min) / x_range * chart_width as f64).abs();
-                        if sel_width_px > 5.0 {
+                            ((new_x_max - new_x_min) / x_range * chart_width as f64).abs();
+                        let sel_height_px =
+                            ((new_y_max - new_y_min) / y_range * chart_height as f64).abs();
+                        if sel_width_px > 5.0 && sel_height_px > 5.0 {
                             self.view_x_min_us =
-                                new_min.max(self.layout.time_min_us as f64);
+                                new_x_min.max(self.layout.time_min_us as f64);
                             self.view_x_max_us =
-                                new_max.min(self.layout.time_max_us as f64);
+                                new_x_max.min(self.layout.time_max_us as f64);
+                            self.view_y_min_bytes = new_y_min.max(0.0);
+                            self.view_y_max_bytes = new_y_max;
                             self.invalidate_cache();
                         }
                     }
                 }
             }
 
-            // Double-click to fit Y
+            // Double-click empty space: reset to fully zoomed out
             if response.double_clicked() {
-                self.view_y_min_bytes = 0.0;
-                self.view_y_max_bytes = self.layout.peak_bytes as f64 * 1.05;
-                self.invalidate_cache();
+                let on_allocation = response.interact_pointer_pos().map_or(false, |pos| {
+                    if !chart_rect.contains(pos) {
+                        return false;
+                    }
+                    let px = ((pos.x - chart_rect.min.x) / chart_width * w_px as f32) as usize;
+                    let py = ((pos.y - chart_rect.min.y) / chart_height * h_px as f32) as usize;
+                    if let Some(cache) = &self.cache {
+                        px < w_px && py < h_px && cache.hover_map[py * w_px + px] != u32::MAX
+                    } else {
+                        false
+                    }
+                });
+                if !on_allocation {
+                    self.view_x_min_us = self.layout.time_min_us as f64;
+                    self.view_x_max_us = self.layout.time_max_us as f64;
+                    self.view_y_min_bytes = 0.0;
+                    self.view_y_max_bytes = self.layout.peak_bytes as f64 * 1.05;
+                    self.invalidate_cache();
+                }
             }
         });
 
