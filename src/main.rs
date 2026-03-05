@@ -1445,7 +1445,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y only, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1920,18 +1920,8 @@ impl eframe::App for MemoryVizApp {
                         let shift = ui.input(|i| i.modifiers.shift);
                         let factor = if scroll.y > 0.0 { 0.87 } else { 1.15 };
 
-                        if shift {
-                            let pivot_bytes = screen_y_to_bytes(pos.y);
-                            let new_min =
-                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
-                            let new_max =
-                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
-                            if new_max - new_min > 1000.0 {
-                                self.view_y_min_bytes = new_min.max(0.0);
-                                self.view_y_max_bytes = new_max;
-                                self.invalidate_cache();
-                            }
-                        } else {
+                        // Zoom X axis (always, unless shift-only)
+                        if !shift {
                             let pivot_us = screen_x_to_us(pos.x);
                             let new_min = pivot_us - (pivot_us - self.view_x_min_us) * factor;
                             let new_max = pivot_us + (self.view_x_max_us - pivot_us) * factor;
@@ -1945,9 +1935,23 @@ impl eframe::App for MemoryVizApp {
                             {
                                 self.view_x_min_us = clamped_min;
                                 self.view_x_max_us = clamped_max;
-                                self.invalidate_cache();
                             }
                         }
+
+                        // Zoom Y axis (always)
+                        {
+                            let pivot_bytes = screen_y_to_bytes(pos.y);
+                            let new_min =
+                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
+                            let new_max =
+                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
+                            if new_max - new_min > 1000.0 {
+                                self.view_y_min_bytes = new_min.max(0.0);
+                                self.view_y_max_bytes = new_max;
+                            }
+                        }
+
+                        self.invalidate_cache();
                     }
                 }
             }
