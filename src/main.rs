@@ -1205,8 +1205,20 @@ impl MemoryVizApp {
             .min(chart_rect.max.y);
 
         let ruler_color = egui::Color32::from_rgb(255, 200, 60);
-        let font = egui::FontId::monospace(11.0);
-        let tick_w = 6.0;
+        let text_color = egui::Color32::BLACK;
+        let bg_color = egui::Color32::from_rgba_premultiplied(255, 200, 60, 200);
+        let font = egui::FontId::monospace(16.0);
+        let tick_w = 12.0;
+        let label_pad = 3.0;
+
+        // Helper: draw text with background pill
+        let draw_label = |painter: &egui::Painter, pos: egui::Pos2, align: egui::Align2, text: String| {
+            let galley = painter.layout_no_wrap(text, font.clone(), text_color);
+            let text_rect = align.anchor_size(pos, galley.size());
+            let bg_rect = text_rect.expand(label_pad);
+            painter.rect_filled(bg_rect, 3.0, bg_color);
+            painter.galley(text_rect.min, galley, text_color);
+        };
 
         // Vertical line
         painter.line_segment(
@@ -1222,12 +1234,11 @@ impl MemoryVizApp {
             ],
             egui::Stroke::new(2.0, ruler_color),
         );
-        painter.text(
+        draw_label(
+            painter,
             egui::pos2(x + tick_w + 4.0, y_top),
             egui::Align2::LEFT_CENTER,
             Self::format_bytes(ruler.y_max_bytes),
-            font.clone(),
-            ruler_color,
         );
 
         // Bottom tick + label (min bytes)
@@ -1238,23 +1249,21 @@ impl MemoryVizApp {
             ],
             egui::Stroke::new(2.0, ruler_color),
         );
-        painter.text(
+        draw_label(
+            painter,
             egui::pos2(x + tick_w + 4.0, y_bot),
             egui::Align2::LEFT_CENTER,
             Self::format_bytes(ruler.y_min_bytes),
-            font.clone(),
-            ruler_color,
         );
 
         // Span label (centered on the line)
         let y_mid = (y_top + y_bot) / 2.0;
         let span = ruler.y_max_bytes - ruler.y_min_bytes;
-        painter.text(
+        draw_label(
+            painter,
             egui::pos2(x + tick_w + 4.0, y_mid),
             egui::Align2::LEFT_CENTER,
             format!("Δ {}", Self::format_bytes(span)),
-            font,
-            ruler_color,
         );
     }
 
