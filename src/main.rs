@@ -881,9 +881,11 @@ struct MemoryVizApp {
     // Cmd+drag region selection
     drag_select: Option<DragSelect>,
 
-    // Ruler: R+drag to place a vertical measurement ruler
+    // Rulers: R+drag = vertical, T+drag = horizontal
     ruler_drag: Option<RulerDrag>,
     ruler: Option<Ruler>,
+    hruler_drag: Option<HRulerDrag>,
+    hruler: Option<HRuler>,
 
     // Show annotations toggle
     show_annotations: bool,
@@ -943,6 +945,19 @@ struct Ruler {
     y_max_bytes: f64,
 }
 
+/// In-progress horizontal ruler drag (T+drag)
+struct HRulerDrag {
+    screen_y: f32,
+    start_us: f64,
+}
+
+/// A placed horizontal measurement ruler (stored in data coordinates)
+struct HRuler {
+    y_bytes: f64,
+    x_min_us: f64,
+    x_max_us: f64,
+}
+
 impl MemoryVizApp {
     fn new(
         layout: PolygonLayout,
@@ -991,6 +1006,8 @@ impl MemoryVizApp {
             drag_select: None,
             ruler_drag: None,
             ruler: None,
+            hruler_drag: None,
+            hruler: None,
             show_annotations: true,
             tooltip_dismissed: false,
             dismissed_rect_idx: u32::MAX,
@@ -1354,6 +1371,85 @@ impl MemoryVizApp {
         );
     }
 
+    fn draw_hruler(
+        painter: &egui::Painter,
+        hruler: &HRuler,
+        bytes_to_screen_y: &dyn Fn(f64) -> f32,
+        us_to_screen_x: &dyn Fn(f64) -> f32,
+        chart_rect: egui::Rect,
+    ) {
+        let y = bytes_to_screen_y(hruler.y_bytes)
+            .max(chart_rect.min.y)
+            .min(chart_rect.max.y);
+        let x_left = us_to_screen_x(hruler.x_min_us)
+            .max(chart_rect.min.x)
+            .min(chart_rect.max.x);
+        let x_right = us_to_screen_x(hruler.x_max_us)
+            .max(chart_rect.min.x)
+            .min(chart_rect.max.x);
+
+        let ruler_color = egui::Color32::from_rgb(255, 200, 60);
+        let text_color = egui::Color32::BLACK;
+        let bg_color = egui::Color32::from_rgba_premultiplied(255, 200, 60, 200);
+        let font = egui::FontId::monospace(14.0);
+        let tick_h = 12.0;
+        let label_pad = 3.0;
+
+        let draw_label = |painter: &egui::Painter, pos: egui::Pos2, align: egui::Align2, text: String| {
+            let galley = painter.layout_no_wrap(text, font.clone(), text_color);
+            let text_rect = align.anchor_size(pos, galley.size());
+            let bg_rect = text_rect.expand(label_pad);
+            painter.rect_filled(bg_rect, 3.0, bg_color);
+            painter.galley(text_rect.min, galley, text_color);
+        };
+
+        // Horizontal line
+        painter.line_segment(
+            [egui::pos2(x_left, y), egui::pos2(x_right, y)],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+
+        // Left tick + label
+        painter.line_segment(
+            [
+                egui::pos2(x_left, y - tick_h),
+                egui::pos2(x_left, y + tick_h),
+            ],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+        draw_label(
+            painter,
+            egui::pos2(x_left, y - tick_h - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            Self::format_time_us(hruler.x_min_us),
+        );
+
+        // Right tick + label
+        painter.line_segment(
+            [
+                egui::pos2(x_right, y - tick_h),
+                egui::pos2(x_right, y + tick_h),
+            ],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+        draw_label(
+            painter,
+            egui::pos2(x_right, y - tick_h - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            Self::format_time_us(hruler.x_max_us),
+        );
+
+        // Span label (centered above the line)
+        let x_mid = (x_left + x_right) / 2.0;
+        let span = hruler.x_max_us - hruler.x_min_us;
+        draw_label(
+            painter,
+            egui::pos2(x_mid, y - tick_h - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("Δ {}", Self::format_time_us(span)),
+        );
+    }
+
     fn format_bytes(bytes: f64) -> String {
         let abs = bytes.abs();
         if abs >= 1e9 {
@@ -1634,7 +1730,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, R+Drag=ruler (Esc=dismiss), Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, R+Drag=vertical ruler, T+Drag=horizontal ruler (Esc=dismiss), Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -2153,9 +2249,10 @@ impl eframe::App for MemoryVizApp {
                 }
             }
 
-            // Drag: Cmd+drag = region select, R+drag = ruler, plain drag = pan
+            // Drag: Cmd+drag = region select, R+drag = vertical ruler, T+drag = horizontal ruler, plain drag = pan
             let cmd_held = ui.input(|i| i.modifiers.command);
             let r_held = ui.input(|i| i.keys_down.contains(&egui::Key::R));
+            let t_held = ui.input(|i| i.keys_down.contains(&egui::Key::T));
 
             if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -2172,15 +2269,20 @@ impl eframe::App for MemoryVizApp {
                                 screen_x: pos.x,
                                 start_bytes: screen_y_to_bytes(pos.y),
                             });
+                        } else if t_held {
+                            self.hruler_drag = Some(HRulerDrag {
+                                screen_y: pos.y,
+                                start_us: screen_x_to_us(pos.x),
+                            });
                         }
                     }
                 }
             }
 
             if response.dragged() {
-                if self.drag_select.is_some() || self.ruler_drag.is_some() {
-                    // Cmd+drag or R+drag: overlays handled below
-                } else if !cmd_held && !r_held {
+                if self.drag_select.is_some() || self.ruler_drag.is_some() || self.hruler_drag.is_some() {
+                    // Cmd+drag, R+drag, or T+drag: overlays handled below
+                } else if !cmd_held && !r_held && !t_held {
                     // Plain drag: pan
                     let delta = response.drag_delta();
                     let dx_us = -delta.x as f64 / chart_width as f64 * x_range;
@@ -2245,31 +2347,46 @@ impl eframe::App for MemoryVizApp {
                 }
             }
 
-            // Draw ruler drag preview
+            // Draw ruler drag previews
+            let ruler_color = egui::Color32::from_rgb(255, 200, 60);
             if let Some(ref rd) = self.ruler_drag {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     let x = rd.screen_x.max(chart_rect.min.x).min(chart_rect.max.x);
                     let y_start = bytes_to_screen_y(rd.start_bytes);
                     let y_end = pos.y.max(chart_rect.min.y).min(chart_rect.max.y);
-                    let ruler_color = egui::Color32::from_rgb(255, 200, 60);
                     painter.line_segment(
                         [egui::pos2(x, y_start), egui::pos2(x, y_end)],
                         egui::Stroke::new(2.0, ruler_color),
                     );
                 }
             }
+            if let Some(ref hrd) = self.hruler_drag {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let y = hrd.screen_y.max(chart_rect.min.y).min(chart_rect.max.y);
+                    let x_start = us_to_screen_x(hrd.start_us);
+                    let x_end = pos.x.max(chart_rect.min.x).min(chart_rect.max.x);
+                    painter.line_segment(
+                        [egui::pos2(x_start, y), egui::pos2(x_end, y)],
+                        egui::Stroke::new(2.0, ruler_color),
+                    );
+                }
+            }
 
-            // Draw persistent ruler
+            // Draw persistent rulers
             if let Some(ref ruler) = self.ruler {
                 Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
             }
-
-            // Dismiss ruler with Escape
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.ruler = None;
+            if let Some(ref hruler) = self.hruler {
+                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
             }
 
-            // On drag release: if we were selecting, zoom to region; if ruler drag, place ruler
+            // Dismiss rulers with Escape
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.ruler = None;
+                self.hruler = None;
+            }
+
+            // On drag release: place rulers or zoom to region
             if response.drag_stopped() {
                 if let Some(rd) = self.ruler_drag.take() {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -2285,6 +2402,25 @@ impl eframe::App for MemoryVizApp {
                                 x_us: screen_x_to_us(rd.screen_x),
                                 y_min_bytes: y_min,
                                 y_max_bytes: y_max,
+                            });
+                        }
+                    }
+                }
+
+                if let Some(hrd) = self.hruler_drag.take() {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        let end_us = screen_x_to_us(pos.x);
+                        let (x_min, x_max) = if hrd.start_us < end_us {
+                            (hrd.start_us, end_us)
+                        } else {
+                            (end_us, hrd.start_us)
+                        };
+                        let span_px = ((x_max - x_min) / x_range * chart_width as f64).abs();
+                        if span_px > 5.0 {
+                            self.hruler = Some(HRuler {
+                                y_bytes: screen_y_to_bytes(hrd.screen_y),
+                                x_min_us: x_min,
+                                x_max_us: x_max,
                             });
                         }
                     }
