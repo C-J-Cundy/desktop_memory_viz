@@ -894,6 +894,9 @@ struct MemoryVizApp {
     // Show quantized dtype factorizations (4-bit, int8)
     show_quantized: bool,
 
+    // Only show exact shape matches (no near-miss annotations)
+    exact_shapes_only: bool,
+
     // GPU memory capacity in bytes (for drawing capacity line)
     gpu_capacity_bytes: Option<f64>,
     gpu_label: Option<String>,
@@ -974,6 +977,7 @@ impl MemoryVizApp {
             dismissed_rect_idx: u32::MAX,
             model_config,
             show_quantized,
+            exact_shapes_only: false,
             gpu_capacity_bytes,
             gpu_label,
             last_frame_time: std::time::Instant::now(),
@@ -1085,7 +1089,7 @@ impl MemoryVizApp {
 
         // If no exact matches, try near-miss: check if bytes is within a small
         // tolerance of a clean factorization (e.g. allocator overhead / alignment).
-        if results.is_empty() {
+        if results.is_empty() && !self.exact_shapes_only {
             let max_slop: u64 = 512; // bytes
             for &(num, den, dtype_label) in dtypes {
                 for delta in 1..=max_slop {
@@ -1401,6 +1405,9 @@ impl eframe::App for MemoryVizApp {
                     self.invalidate_cache();
                 }
                 ui.checkbox(&mut self.show_annotations, "Annotations");
+                if self.model_config.is_some() {
+                    ui.checkbox(&mut self.exact_shapes_only, "Exact shapes only");
+                }
                 ui.separator();
                 if let Some(cache) = &self.cache {
                     ui.label(format!(
