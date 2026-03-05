@@ -894,6 +894,9 @@ struct MemoryVizApp {
     // Show quantized dtype factorizations (4-bit, int8)
     show_quantized: bool,
 
+    // Only show exact shape matches (no near-miss annotations)
+    exact_shapes_only: bool,
+
     // GPU memory capacity in bytes (for drawing capacity line)
     gpu_capacity_bytes: Option<f64>,
     gpu_label: Option<String>,
@@ -974,6 +977,7 @@ impl MemoryVizApp {
             dismissed_rect_idx: u32::MAX,
             model_config,
             show_quantized,
+            exact_shapes_only: false,
             gpu_capacity_bytes,
             gpu_label,
             last_frame_time: std::time::Instant::now(),
@@ -1083,6 +1087,32 @@ impl MemoryVizApp {
             }
         }
 
+        // If no exact matches, try near-miss: check if bytes is within a small
+        // tolerance of a clean factorization (e.g. allocator overhead / alignment).
+        if results.is_empty() && !self.exact_shapes_only {
+            let max_slop: u64 = 512; // bytes
+            for &(num, den, dtype_label) in dtypes {
+                for delta in 1..=max_slop {
+                    if bytes <= delta {
+                        continue;
+                    }
+                    let candidate = bytes - delta;
+                    let numer = candidate * num;
+                    if numer % den != 0 {
+                        continue;
+                    }
+                    let elements = numer / den;
+                    if elements == 0 {
+                        continue;
+                    }
+                    if let Some(desc) = Self::try_factor(elements, h, i, v) {
+                        results.push(format!("≈{}: {} (+{}B)", dtype_label, desc, delta));
+                        break; // one near-miss per dtype is enough
+                    }
+                }
+            }
+        }
+
         if results.is_empty() {
             None
         } else {
@@ -1091,8 +1121,9 @@ impl MemoryVizApp {
     }
 
     /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
-    /// vocab_size (v), and (2v+1) for tied embed/unembed. Returns the most informative description.
+    /// vocab_size (v), (v+1) for padded vocab, and (2v+1) for tied embed/unembed.
     fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
+        let vp = if v > 0 { v + 1 } else { 0 }; // padded vocab
         let v2 = if v > 0 { 2 * v + 1 } else { 0 }; // tied embed+unembed
 
         // v x h (embedding / lm_head)
@@ -1102,6 +1133,15 @@ impl MemoryVizApp {
                 return Some("v x h".to_string());
             }
             return Some(format!("{} x v x h", n));
+        }
+
+        // (v+1) x h (padded embedding)
+        if vp > 0 && h > 0 && elements % (vp * h) == 0 {
+            let n = elements / (vp * h);
+            if n == 1 {
+                return Some("(v+1) x h".to_string());
+            }
+            return Some(format!("{} x (v+1) x h", n));
         }
 
         // (2v+1) x h (tied embed+unembed)
@@ -1140,6 +1180,15 @@ impl MemoryVizApp {
             return Some(format!("{} x v x i", n));
         }
 
+        // (v+1) x i
+        if vp > 0 && i > 0 && elements % (vp * i) == 0 {
+            let n = elements / (vp * i);
+            if n == 1 {
+                return Some("(v+1) x i".to_string());
+            }
+            return Some(format!("{} x (v+1) x i", n));
+        }
+
         // (2v+1) x i
         if v2 > 0 && i > 0 && elements % (v2 * i) == 0 {
             let n = elements / (v2 * i);
@@ -1165,6 +1214,15 @@ impl MemoryVizApp {
                 return Some("[v]".to_string());
             }
             return Some(format!("{} x v", n));
+        }
+
+        // N x (v+1)
+        if vp > 0 && vp != h && vp != i && elements % vp == 0 {
+            let n = elements / vp;
+            if n == 1 {
+                return Some("[(v+1)]".to_string());
+            }
+            return Some(format!("{} x (v+1)", n));
         }
 
         // N x (2v+1)
@@ -1375,6 +1433,9 @@ impl eframe::App for MemoryVizApp {
                     self.invalidate_cache();
                 }
                 ui.checkbox(&mut self.show_annotations, "Annotations");
+                if self.model_config.is_some() {
+                    ui.checkbox(&mut self.exact_shapes_only, "Exact shapes only");
+                }
                 ui.separator();
                 if let Some(cache) = &self.cache {
                     ui.label(format!(
