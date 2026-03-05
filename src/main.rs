@@ -1445,7 +1445,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1914,24 +1914,17 @@ impl eframe::App for MemoryVizApp {
 
             // Scroll to zoom
             let scroll = ui.input(|i| i.raw_scroll_delta);
-            if scroll.y != 0.0 && response.hovered() {
+            let shift = ui.input(|i| i.modifiers.shift);
+            // On macOS, Shift+Scroll is remapped to horizontal scroll, so use scroll.x when shift is held
+            let scroll_amount = if shift && scroll.y == 0.0 { scroll.x } else { scroll.y };
+            if scroll_amount != 0.0 && response.hovered() {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if chart_rect.contains(pos) {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let factor = if scroll.y > 0.0 { 0.87 } else { 1.15 };
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        let factor = if scroll_amount > 0.0 { 0.87 } else { 1.15 };
 
-                        if shift {
-                            let pivot_bytes = screen_y_to_bytes(pos.y);
-                            let new_min =
-                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
-                            let new_max =
-                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
-                            if new_max - new_min > 1000.0 {
-                                self.view_y_min_bytes = new_min.max(0.0);
-                                self.view_y_max_bytes = new_max;
-                                self.invalidate_cache();
-                            }
-                        } else {
+                        // Zoom X axis (unless shift-only)
+                        if !shift {
                             let pivot_us = screen_x_to_us(pos.x);
                             let new_min = pivot_us - (pivot_us - self.view_x_min_us) * factor;
                             let new_max = pivot_us + (self.view_x_max_us - pivot_us) * factor;
@@ -1945,9 +1938,28 @@ impl eframe::App for MemoryVizApp {
                             {
                                 self.view_x_min_us = clamped_min;
                                 self.view_x_max_us = clamped_max;
-                                self.invalidate_cache();
                             }
                         }
+
+                        // Zoom Y axis (unless alt/option-only)
+                        if !alt {
+                            let pivot_bytes = screen_y_to_bytes(pos.y);
+                            let new_min =
+                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
+                            let new_max =
+                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
+                            let full_y_range = self.layout.peak_bytes as f64 * 1.05;
+                            let clamped_min = new_min.max(0.0);
+                            let clamped_max = new_max.min(full_y_range);
+                            if clamped_max - clamped_min > 1000.0
+                                && clamped_max - clamped_min <= full_y_range
+                            {
+                                self.view_y_min_bytes = clamped_min;
+                                self.view_y_max_bytes = clamped_max;
+                            }
+                        }
+
+                        self.invalidate_cache();
                     }
                 }
             }
