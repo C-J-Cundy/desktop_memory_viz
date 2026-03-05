@@ -1207,7 +1207,7 @@ impl MemoryVizApp {
         let ruler_color = egui::Color32::from_rgb(255, 200, 60);
         let text_color = egui::Color32::BLACK;
         let bg_color = egui::Color32::from_rgba_premultiplied(255, 200, 60, 200);
-        let font = egui::FontId::monospace(16.0);
+        let font = egui::FontId::monospace(14.0);
         let tick_w = 12.0;
         let label_pad = 3.0;
 
@@ -1236,8 +1236,8 @@ impl MemoryVizApp {
         );
         draw_label(
             painter,
-            egui::pos2(x + tick_w + 4.0, y_top),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(x - tick_w - 4.0, y_top),
+            egui::Align2::RIGHT_CENTER,
             Self::format_bytes(ruler.y_max_bytes),
         );
 
@@ -1251,8 +1251,8 @@ impl MemoryVizApp {
         );
         draw_label(
             painter,
-            egui::pos2(x + tick_w + 4.0, y_bot),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(x - tick_w - 4.0, y_bot),
+            egui::Align2::RIGHT_CENTER,
             Self::format_bytes(ruler.y_min_bytes),
         );
 
@@ -1261,8 +1261,8 @@ impl MemoryVizApp {
         let span = ruler.y_max_bytes - ruler.y_min_bytes;
         draw_label(
             painter,
-            egui::pos2(x + tick_w + 4.0, y_mid),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(x - tick_w - 4.0, y_mid),
+            egui::Align2::RIGHT_CENTER,
             format!("Δ {}", Self::format_bytes(span)),
         );
     }
