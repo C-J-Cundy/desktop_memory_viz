@@ -1121,9 +1121,10 @@ impl MemoryVizApp {
     }
 
     /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
-    /// vocab_size (v), and (v+1) for padded vocab. Returns the most informative description.
+    /// vocab_size (v), (v+1) for padded vocab, and (2v+1) for tied embed/unembed.
     fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
         let vp = if v > 0 { v + 1 } else { 0 }; // padded vocab
+        let v2 = if v > 0 { 2 * v + 1 } else { 0 }; // tied embed+unembed
 
         // v x h (embedding / lm_head)
         if v > 0 && h > 0 && elements % (v * h) == 0 {
@@ -1141,6 +1142,15 @@ impl MemoryVizApp {
                 return Some("(v+1) x h".to_string());
             }
             return Some(format!("{} x (v+1) x h", n));
+        }
+
+        // (2v+1) x h (tied embed+unembed)
+        if v2 > 0 && h > 0 && elements % (v2 * h) == 0 {
+            let n = elements / (v2 * h);
+            if n == 1 {
+                return Some("(2v+1) x h".to_string());
+            }
+            return Some(format!("{} x (2v+1) x h", n));
         }
 
         // h x i or i x h
@@ -1179,6 +1189,15 @@ impl MemoryVizApp {
             return Some(format!("{} x (v+1) x i", n));
         }
 
+        // (2v+1) x i
+        if v2 > 0 && i > 0 && elements % (v2 * i) == 0 {
+            let n = elements / (v2 * i);
+            if n == 1 {
+                return Some("(2v+1) x i".to_string());
+            }
+            return Some(format!("{} x (2v+1) x i", n));
+        }
+
         // i x i (less common but possible)
         if i > 0 && i != h && elements % (i * i) == 0 {
             let n = elements / (i * i);
@@ -1204,6 +1223,15 @@ impl MemoryVizApp {
                 return Some("[(v+1)]".to_string());
             }
             return Some(format!("{} x (v+1)", n));
+        }
+
+        // N x (2v+1)
+        if v2 > 0 && v2 != h && v2 != i && elements % v2 == 0 {
+            let n = elements / v2;
+            if n == 1 {
+                return Some("[(2v+1)]".to_string());
+            }
+            return Some(format!("{} x (2v+1)", n));
         }
 
         // N x i
@@ -1507,7 +1535,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1976,24 +2004,17 @@ impl eframe::App for MemoryVizApp {
 
             // Scroll to zoom
             let scroll = ui.input(|i| i.raw_scroll_delta);
-            if scroll.y != 0.0 && response.hovered() {
+            let shift = ui.input(|i| i.modifiers.shift);
+            // On macOS, Shift+Scroll is remapped to horizontal scroll, so use scroll.x when shift is held
+            let scroll_amount = if shift && scroll.y == 0.0 { scroll.x } else { scroll.y };
+            if scroll_amount != 0.0 && response.hovered() {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if chart_rect.contains(pos) {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let factor = if scroll.y > 0.0 { 0.87 } else { 1.15 };
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        let factor = if scroll_amount > 0.0 { 0.87 } else { 1.15 };
 
-                        if shift {
-                            let pivot_bytes = screen_y_to_bytes(pos.y);
-                            let new_min =
-                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
-                            let new_max =
-                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
-                            if new_max - new_min > 1000.0 {
-                                self.view_y_min_bytes = new_min.max(0.0);
-                                self.view_y_max_bytes = new_max;
-                                self.invalidate_cache();
-                            }
-                        } else {
+                        // Zoom X axis (unless shift-only)
+                        if !shift {
                             let pivot_us = screen_x_to_us(pos.x);
                             let new_min = pivot_us - (pivot_us - self.view_x_min_us) * factor;
                             let new_max = pivot_us + (self.view_x_max_us - pivot_us) * factor;
@@ -2007,9 +2028,28 @@ impl eframe::App for MemoryVizApp {
                             {
                                 self.view_x_min_us = clamped_min;
                                 self.view_x_max_us = clamped_max;
-                                self.invalidate_cache();
                             }
                         }
+
+                        // Zoom Y axis (unless alt/option-only)
+                        if !alt {
+                            let pivot_bytes = screen_y_to_bytes(pos.y);
+                            let new_min =
+                                pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
+                            let new_max =
+                                pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
+                            let full_y_range = self.layout.peak_bytes as f64 * 1.05;
+                            let clamped_min = new_min.max(0.0);
+                            let clamped_max = new_max.min(full_y_range);
+                            if clamped_max - clamped_min > 1000.0
+                                && clamped_max - clamped_min <= full_y_range
+                            {
+                                self.view_y_min_bytes = clamped_min;
+                                self.view_y_max_bytes = clamped_max;
+                            }
+                        }
+
+                        self.invalidate_cache();
                     }
                 }
             }
