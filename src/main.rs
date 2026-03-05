@@ -1091,8 +1091,10 @@ impl MemoryVizApp {
     }
 
     /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
-    /// and vocab_size (v). Returns the most informative description.
+    /// vocab_size (v), and (2v+1) for tied embed/unembed. Returns the most informative description.
     fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
+        let v2 = if v > 0 { 2 * v + 1 } else { 0 }; // tied embed+unembed
+
         // v x h (embedding / lm_head)
         if v > 0 && h > 0 && elements % (v * h) == 0 {
             let n = elements / (v * h);
@@ -1100,6 +1102,15 @@ impl MemoryVizApp {
                 return Some("v x h".to_string());
             }
             return Some(format!("{} x v x h", n));
+        }
+
+        // (2v+1) x h (tied embed+unembed)
+        if v2 > 0 && h > 0 && elements % (v2 * h) == 0 {
+            let n = elements / (v2 * h);
+            if n == 1 {
+                return Some("(2v+1) x h".to_string());
+            }
+            return Some(format!("{} x (2v+1) x h", n));
         }
 
         // h x i or i x h
@@ -1129,6 +1140,15 @@ impl MemoryVizApp {
             return Some(format!("{} x v x i", n));
         }
 
+        // (2v+1) x i
+        if v2 > 0 && i > 0 && elements % (v2 * i) == 0 {
+            let n = elements / (v2 * i);
+            if n == 1 {
+                return Some("(2v+1) x i".to_string());
+            }
+            return Some(format!("{} x (2v+1) x i", n));
+        }
+
         // i x i (less common but possible)
         if i > 0 && i != h && elements % (i * i) == 0 {
             let n = elements / (i * i);
@@ -1145,6 +1165,15 @@ impl MemoryVizApp {
                 return Some("[v]".to_string());
             }
             return Some(format!("{} x v", n));
+        }
+
+        // N x (2v+1)
+        if v2 > 0 && v2 != h && v2 != i && elements % v2 == 0 {
+            let n = elements / v2;
+            if n == 1 {
+                return Some("[(2v+1)]".to_string());
+            }
+            return Some(format!("{} x (2v+1)", n));
         }
 
         // N x i
