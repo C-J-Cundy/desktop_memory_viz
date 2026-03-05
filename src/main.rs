@@ -1083,6 +1083,32 @@ impl MemoryVizApp {
             }
         }
 
+        // If no exact matches, try near-miss: check if bytes is within a small
+        // tolerance of a clean factorization (e.g. allocator overhead / alignment).
+        if results.is_empty() {
+            let max_slop: u64 = 512; // bytes
+            for &(num, den, dtype_label) in dtypes {
+                for delta in 1..=max_slop {
+                    if bytes <= delta {
+                        continue;
+                    }
+                    let candidate = bytes - delta;
+                    let numer = candidate * num;
+                    if numer % den != 0 {
+                        continue;
+                    }
+                    let elements = numer / den;
+                    if elements == 0 {
+                        continue;
+                    }
+                    if let Some(desc) = Self::try_factor(elements, h, i, v) {
+                        results.push(format!("≈{}: {} (+{}B)", dtype_label, desc, delta));
+                        break; // one near-miss per dtype is enough
+                    }
+                }
+            }
+        }
+
         if results.is_empty() {
             None
         } else {
@@ -1091,8 +1117,10 @@ impl MemoryVizApp {
     }
 
     /// Try to factor `elements` as products of hidden_size (h), intermediate_size (i),
-    /// and vocab_size (v). Returns the most informative description.
+    /// vocab_size (v), and (v+1) for padded vocab. Returns the most informative description.
     fn try_factor(elements: u64, h: u64, i: u64, v: u64) -> Option<String> {
+        let vp = if v > 0 { v + 1 } else { 0 }; // padded vocab
+
         // v x h (embedding / lm_head)
         if v > 0 && h > 0 && elements % (v * h) == 0 {
             let n = elements / (v * h);
@@ -1100,6 +1128,15 @@ impl MemoryVizApp {
                 return Some("v x h".to_string());
             }
             return Some(format!("{} x v x h", n));
+        }
+
+        // (v+1) x h (padded embedding)
+        if vp > 0 && h > 0 && elements % (vp * h) == 0 {
+            let n = elements / (vp * h);
+            if n == 1 {
+                return Some("(v+1) x h".to_string());
+            }
+            return Some(format!("{} x (v+1) x h", n));
         }
 
         // h x i or i x h
@@ -1129,6 +1166,15 @@ impl MemoryVizApp {
             return Some(format!("{} x v x i", n));
         }
 
+        // (v+1) x i
+        if vp > 0 && i > 0 && elements % (vp * i) == 0 {
+            let n = elements / (vp * i);
+            if n == 1 {
+                return Some("(v+1) x i".to_string());
+            }
+            return Some(format!("{} x (v+1) x i", n));
+        }
+
         // i x i (less common but possible)
         if i > 0 && i != h && elements % (i * i) == 0 {
             let n = elements / (i * i);
@@ -1145,6 +1191,15 @@ impl MemoryVizApp {
                 return Some("[v]".to_string());
             }
             return Some(format!("{} x v", n));
+        }
+
+        // N x (v+1)
+        if vp > 0 && vp != h && vp != i && elements % vp == 0 {
+            let n = elements / vp;
+            if n == 1 {
+                return Some("[(v+1)]".to_string());
+            }
+            return Some(format!("{} x (v+1)", n));
         }
 
         // N x i
