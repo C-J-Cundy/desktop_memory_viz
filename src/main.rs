@@ -1445,7 +1445,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y only, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1918,9 +1918,10 @@ impl eframe::App for MemoryVizApp {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if chart_rect.contains(pos) {
                         let shift = ui.input(|i| i.modifiers.shift);
+                        let alt = ui.input(|i| i.modifiers.alt);
                         let factor = if scroll.y > 0.0 { 0.87 } else { 1.15 };
 
-                        // Zoom X axis (always, unless shift-only)
+                        // Zoom X axis (unless shift-only)
                         if !shift {
                             let pivot_us = screen_x_to_us(pos.x);
                             let new_min = pivot_us - (pivot_us - self.view_x_min_us) * factor;
@@ -1938,8 +1939,8 @@ impl eframe::App for MemoryVizApp {
                             }
                         }
 
-                        // Zoom Y axis (always)
-                        {
+                        // Zoom Y axis (unless alt/option-only)
+                        if !alt {
                             let pivot_bytes = screen_y_to_bytes(pos.y);
                             let new_min =
                                 pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
