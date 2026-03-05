@@ -881,6 +881,10 @@ struct MemoryVizApp {
     // Cmd+drag region selection
     drag_select: Option<DragSelect>,
 
+    // Ruler: R+drag to place a vertical measurement ruler
+    ruler_drag: Option<RulerDrag>,
+    ruler: Option<Ruler>,
+
     // Show annotations toggle
     show_annotations: bool,
 
@@ -921,6 +925,19 @@ struct DragSelect {
     start_bytes: f64,
     start_screen_x: f32,
     start_screen_y: f32,
+}
+
+/// In-progress ruler drag (R+drag)
+struct RulerDrag {
+    screen_x: f32,
+    start_bytes: f64,
+}
+
+/// A placed vertical measurement ruler (stored in data coordinates)
+struct Ruler {
+    x_us: f64,
+    y_min_bytes: f64,
+    y_max_bytes: f64,
 }
 
 impl MemoryVizApp {
@@ -969,6 +986,8 @@ impl MemoryVizApp {
             last_hover_info: None,
             pinned_rect_idx: None,
             drag_select: None,
+            ruler_drag: None,
+            ruler: None,
             show_annotations: true,
             tooltip_dismissed: false,
             dismissed_rect_idx: u32::MAX,
@@ -1166,6 +1185,77 @@ impl MemoryVizApp {
         }
 
         None
+    }
+
+    fn draw_ruler(
+        painter: &egui::Painter,
+        ruler: &Ruler,
+        bytes_to_screen_y: &dyn Fn(f64) -> f32,
+        us_to_screen_x: &dyn Fn(f64) -> f32,
+        chart_rect: egui::Rect,
+    ) {
+        let x = us_to_screen_x(ruler.x_us)
+            .max(chart_rect.min.x)
+            .min(chart_rect.max.x);
+        let y_top = bytes_to_screen_y(ruler.y_max_bytes)
+            .max(chart_rect.min.y)
+            .min(chart_rect.max.y);
+        let y_bot = bytes_to_screen_y(ruler.y_min_bytes)
+            .max(chart_rect.min.y)
+            .min(chart_rect.max.y);
+
+        let ruler_color = egui::Color32::from_rgb(255, 200, 60);
+        let font = egui::FontId::monospace(11.0);
+        let tick_w = 6.0;
+
+        // Vertical line
+        painter.line_segment(
+            [egui::pos2(x, y_top), egui::pos2(x, y_bot)],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+
+        // Top tick + label (max bytes)
+        painter.line_segment(
+            [
+                egui::pos2(x - tick_w, y_top),
+                egui::pos2(x + tick_w, y_top),
+            ],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+        painter.text(
+            egui::pos2(x + tick_w + 4.0, y_top),
+            egui::Align2::LEFT_CENTER,
+            Self::format_bytes(ruler.y_max_bytes),
+            font.clone(),
+            ruler_color,
+        );
+
+        // Bottom tick + label (min bytes)
+        painter.line_segment(
+            [
+                egui::pos2(x - tick_w, y_bot),
+                egui::pos2(x + tick_w, y_bot),
+            ],
+            egui::Stroke::new(2.0, ruler_color),
+        );
+        painter.text(
+            egui::pos2(x + tick_w + 4.0, y_bot),
+            egui::Align2::LEFT_CENTER,
+            Self::format_bytes(ruler.y_min_bytes),
+            font.clone(),
+            ruler_color,
+        );
+
+        // Span label (centered on the line)
+        let y_mid = (y_top + y_bot) / 2.0;
+        let span = ruler.y_max_bytes - ruler.y_min_bytes;
+        painter.text(
+            egui::pos2(x + tick_w + 4.0, y_mid),
+            egui::Align2::LEFT_CENTER,
+            format!("Δ {}", Self::format_bytes(span)),
+            font,
+            ruler_color,
+        );
     }
 
     fn format_bytes(bytes: f64) -> String {
@@ -1445,7 +1535,7 @@ impl eframe::App for MemoryVizApp {
                     }
                 } else {
                     let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
-                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
+                    ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom X, Shift+Scroll=zoom Y, Drag=pan, Cmd+Drag=select region, R+Drag=ruler (Esc=dismiss), Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
             });
 
@@ -1952,26 +2042,34 @@ impl eframe::App for MemoryVizApp {
                 }
             }
 
-            // Drag: Cmd+drag = region select, plain drag = pan
+            // Drag: Cmd+drag = region select, R+drag = ruler, plain drag = pan
             let cmd_held = ui.input(|i| i.modifiers.command);
+            let r_held = ui.input(|i| i.keys_down.contains(&egui::Key::R));
 
-            if response.drag_started() && cmd_held {
+            if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     if chart_rect.contains(pos) {
-                        self.drag_select = Some(DragSelect {
-                            start_us: screen_x_to_us(pos.x),
-                            start_bytes: screen_y_to_bytes(pos.y),
-                            start_screen_x: pos.x,
-                            start_screen_y: pos.y,
-                        });
+                        if cmd_held {
+                            self.drag_select = Some(DragSelect {
+                                start_us: screen_x_to_us(pos.x),
+                                start_bytes: screen_y_to_bytes(pos.y),
+                                start_screen_x: pos.x,
+                                start_screen_y: pos.y,
+                            });
+                        } else if r_held {
+                            self.ruler_drag = Some(RulerDrag {
+                                screen_x: pos.x,
+                                start_bytes: screen_y_to_bytes(pos.y),
+                            });
+                        }
                     }
                 }
             }
 
             if response.dragged() {
-                if self.drag_select.is_some() {
-                    // Cmd+drag: draw selection overlay (handled below)
-                } else if !cmd_held {
+                if self.drag_select.is_some() || self.ruler_drag.is_some() {
+                    // Cmd+drag or R+drag: overlays handled below
+                } else if !cmd_held && !r_held {
                     // Plain drag: pan
                     let delta = response.drag_delta();
                     let dx_us = -delta.x as f64 / chart_width as f64 * x_range;
@@ -2036,8 +2134,51 @@ impl eframe::App for MemoryVizApp {
                 }
             }
 
-            // On drag release: if we were selecting, zoom to region
+            // Draw ruler drag preview
+            if let Some(ref rd) = self.ruler_drag {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let x = rd.screen_x.max(chart_rect.min.x).min(chart_rect.max.x);
+                    let y_start = bytes_to_screen_y(rd.start_bytes);
+                    let y_end = pos.y.max(chart_rect.min.y).min(chart_rect.max.y);
+                    let ruler_color = egui::Color32::from_rgb(255, 200, 60);
+                    painter.line_segment(
+                        [egui::pos2(x, y_start), egui::pos2(x, y_end)],
+                        egui::Stroke::new(2.0, ruler_color),
+                    );
+                }
+            }
+
+            // Draw persistent ruler
+            if let Some(ref ruler) = self.ruler {
+                Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
+            }
+
+            // Dismiss ruler with Escape
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.ruler = None;
+            }
+
+            // On drag release: if we were selecting, zoom to region; if ruler drag, place ruler
             if response.drag_stopped() {
+                if let Some(rd) = self.ruler_drag.take() {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        let end_bytes = screen_y_to_bytes(pos.y);
+                        let (y_min, y_max) = if rd.start_bytes < end_bytes {
+                            (rd.start_bytes, end_bytes)
+                        } else {
+                            (end_bytes, rd.start_bytes)
+                        };
+                        let span_px = ((y_max - y_min) / y_range * chart_height as f64).abs();
+                        if span_px > 5.0 {
+                            self.ruler = Some(Ruler {
+                                x_us: screen_x_to_us(rd.screen_x),
+                                y_min_bytes: y_min,
+                                y_max_bytes: y_max,
+                            });
+                        }
+                    }
+                }
+
                 if let Some(sel) = self.drag_select.take() {
                     if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                         let end_us = screen_x_to_us(pos.x);
