@@ -1914,12 +1914,14 @@ impl eframe::App for MemoryVizApp {
 
             // Scroll to zoom
             let scroll = ui.input(|i| i.raw_scroll_delta);
-            if scroll.y != 0.0 && response.hovered() {
+            let shift = ui.input(|i| i.modifiers.shift);
+            // On macOS, Shift+Scroll is remapped to horizontal scroll, so use scroll.x when shift is held
+            let scroll_amount = if shift && scroll.y == 0.0 { scroll.x } else { scroll.y };
+            if scroll_amount != 0.0 && response.hovered() {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if chart_rect.contains(pos) {
-                        let shift = ui.input(|i| i.modifiers.shift);
                         let alt = ui.input(|i| i.modifiers.alt);
-                        let factor = if scroll.y > 0.0 { 0.87 } else { 1.15 };
+                        let factor = if scroll_amount > 0.0 { 0.87 } else { 1.15 };
 
                         // Zoom X axis (unless shift-only)
                         if !shift {
