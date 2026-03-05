@@ -1948,9 +1948,14 @@ impl eframe::App for MemoryVizApp {
                                 pivot_bytes - (pivot_bytes - self.view_y_min_bytes) * factor;
                             let new_max =
                                 pivot_bytes + (self.view_y_max_bytes - pivot_bytes) * factor;
-                            if new_max - new_min > 1000.0 {
-                                self.view_y_min_bytes = new_min.max(0.0);
-                                self.view_y_max_bytes = new_max;
+                            let full_y_range = self.layout.peak_bytes as f64 * 1.05;
+                            let clamped_min = new_min.max(0.0);
+                            let clamped_max = new_max.min(full_y_range);
+                            if clamped_max - clamped_min > 1000.0
+                                && clamped_max - clamped_min <= full_y_range
+                            {
+                                self.view_y_min_bytes = clamped_min;
+                                self.view_y_max_bytes = clamped_max;
                             }
                         }
 
