@@ -2278,7 +2278,11 @@ impl eframe::App for MemoryVizApp {
             let t_held = ui.input(|i| i.keys_down.contains(&egui::Key::T));
 
             if response.drag_started() {
-                if let Some(pos) = response.interact_pointer_pos() {
+                // Use press_origin for the start position so the ruler/selection
+                // begins exactly where the user clicked, not where the pointer
+                // is when the drag threshold is exceeded.
+                let origin = ui.input(|i| i.pointer.press_origin());
+                if let Some(pos) = origin {
                     if chart_rect.contains(pos) {
                         if cmd_held {
                             self.drag_select = Some(DragSelect {
