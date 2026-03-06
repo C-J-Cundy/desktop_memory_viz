@@ -49,6 +49,11 @@ struct Cli {
     /// GPU model for showing memory capacity line (e.g., "H100", "H100-80", "A100-80", "A100-40")
     #[arg(long)]
     gpu: Option<String>,
+
+    /// Memory offset in MiB for memory allocated before the snapshot starts
+    /// (e.g., if capturing mid-run). Added to all displayed memory values.
+    #[arg(long, default_value = "0")]
+    offset: f64,
 }
 
 // ── Model config (fetched from HuggingFace) ─────────────────────────
@@ -602,7 +607,7 @@ fn build_polygon_layout(
         total_summarized_mem,
     );
 
-    eprintln!("  Peak memory: {:.2} GB", peak / 1e9);
+    eprintln!("  Peak memory: {:.0} MiB", peak / (1024.0 * 1024.0));
     eprintln!("  {} tracked polygons", polygons.len());
     let total_history: usize = polygons.iter().map(|p| p.times_us.len()).sum();
     eprintln!("  {} total offset history entries", total_history);
@@ -907,6 +912,9 @@ struct MemoryVizApp {
     gpu_capacity_bytes: Option<f64>,
     gpu_label: Option<String>,
 
+    // Memory offset in bytes (pre-allocated memory not in the snapshot)
+    memory_offset_bytes: f64,
+
     // FPS counter
     last_frame_time: std::time::Instant,
     fps_smooth: f64,
@@ -964,6 +972,7 @@ impl MemoryVizApp {
         model_config: Option<ModelConfig>,
         show_quantized: bool,
         gpu: Option<String>,
+        memory_offset_bytes: f64,
     ) -> Self {
         let view_x_min_us = layout.time_min_us as f64;
         let view_x_max_us = layout.time_max_us as f64;
@@ -972,16 +981,17 @@ impl MemoryVizApp {
 
         let (gpu_capacity_bytes, gpu_label) = match gpu.as_deref() {
             Some(g) => {
+                let gib = 1024.0 * 1024.0 * 1024.0;
                 let capacity: Option<f64> = match g.to_uppercase().as_str() {
-                    "H100" | "H100-80" => Some(80.0 * 1e9),
-                    "A100" | "A100-80" => Some(80.0 * 1e9),
-                    "A100-40" => Some(40.0 * 1e9),
-                    "H200" => Some(141.0 * 1e9),
-                    "A10G" => Some(24.0 * 1e9),
-                    "L40S" => Some(48.0 * 1e9),
-                    "V100" | "V100-32" => Some(32.0 * 1e9),
-                    "V100-16" => Some(16.0 * 1e9),
-                    "4090" | "RTX4090" => Some(24.0 * 1e9),
+                    "H100" | "H100-80" => Some(80.0 * gib),
+                    "A100" | "A100-80" => Some(80.0 * gib),
+                    "A100-40" => Some(40.0 * gib),
+                    "H200" => Some(141.0 * gib),
+                    "A10G" => Some(24.0 * gib),
+                    "L40S" => Some(48.0 * gib),
+                    "V100" | "V100-32" => Some(32.0 * gib),
+                    "V100-16" => Some(16.0 * gib),
+                    "4090" | "RTX4090" => Some(24.0 * gib),
                     _ => {
                         eprintln!("Warning: unknown GPU '{}', no capacity line will be shown", g);
                         None
@@ -1016,6 +1026,7 @@ impl MemoryVizApp {
             exact_shapes_only: false,
             gpu_capacity_bytes,
             gpu_label,
+            memory_offset_bytes,
             last_frame_time: std::time::Instant::now(),
             fps_smooth: 0.0,
         }
@@ -1297,6 +1308,7 @@ impl MemoryVizApp {
         bytes_to_screen_y: &dyn Fn(f64) -> f32,
         us_to_screen_x: &dyn Fn(f64) -> f32,
         chart_rect: egui::Rect,
+        memory_offset_bytes: f64,
     ) {
         let x = us_to_screen_x(ruler.x_us)
             .max(chart_rect.min.x)
@@ -1342,7 +1354,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x - tick_w - 4.0, y_top),
             egui::Align2::RIGHT_CENTER,
-            Self::format_bytes(ruler.y_max_bytes),
+            Self::format_bytes(ruler.y_max_bytes + memory_offset_bytes),
         );
 
         // Bottom tick + label (min bytes)
@@ -1357,7 +1369,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x - tick_w - 4.0, y_bot),
             egui::Align2::RIGHT_CENTER,
-            Self::format_bytes(ruler.y_min_bytes),
+            Self::format_bytes(ruler.y_min_bytes + memory_offset_bytes),
         );
 
         // Span label (centered on the line)
@@ -1377,6 +1389,7 @@ impl MemoryVizApp {
         bytes_to_screen_y: &dyn Fn(f64) -> f32,
         us_to_screen_x: &dyn Fn(f64) -> f32,
         chart_rect: egui::Rect,
+        time_min_us: f64,
     ) {
         let y = bytes_to_screen_y(hruler.y_bytes)
             .max(chart_rect.min.y)
@@ -1421,7 +1434,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x_left, y - tick_h - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            Self::format_time_us(hruler.x_min_us),
+            Self::format_time_us(hruler.x_min_us - time_min_us),
         );
 
         // Right tick + label
@@ -1436,7 +1449,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x_right, y - tick_h - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            Self::format_time_us(hruler.x_max_us),
+            Self::format_time_us(hruler.x_max_us - time_min_us),
         );
 
         // Span label (centered above the line)
@@ -1451,15 +1464,24 @@ impl MemoryVizApp {
     }
 
     fn format_bytes(bytes: f64) -> String {
-        let abs = bytes.abs();
-        if abs >= 1e9 {
-            format!("{:.2} GB", bytes / 1e9)
-        } else if abs >= 1e6 {
-            format!("{:.1} MB", bytes / 1e6)
-        } else if abs >= 1e3 {
-            format!("{:.0} KB", bytes / 1e3)
+        let mib = bytes / (1024.0 * 1024.0);
+        let abs_mib = mib.abs();
+        if abs_mib >= 100.0 {
+            // Integer MiB with comma separator
+            let n = mib.round() as i64;
+            let s = n.abs().to_string();
+            let mut result = if n < 0 { String::from("-") } else { String::new() };
+            for (i, c) in s.chars().enumerate() {
+                if i > 0 && (s.len() - i) % 3 == 0 {
+                    result.push(',');
+                }
+                result.push(c);
+            }
+            format!("{} MiB", result)
+        } else if abs_mib >= 1.0 {
+            format!("{:.1} MiB", mib)
         } else {
-            format!("{:.0} B", bytes)
+            format!("{:.2} MiB", mib)
         }
     }
 
@@ -1601,7 +1623,7 @@ impl eframe::App for MemoryVizApp {
                     format_count(self.layout.total_events),
                     format_count(self.layout.total_rects),
                     format_count(self.layout.max_entries.min(self.layout.total_rects)),
-                    Self::format_bytes(self.layout.peak_bytes as f64),
+                    Self::format_bytes(self.layout.peak_bytes as f64 + self.memory_offset_bytes),
                     Self::format_time_us(
                         (self.layout.time_max_us - self.layout.time_min_us) as f64
                     ),
@@ -1643,8 +1665,8 @@ impl eframe::App for MemoryVizApp {
                         "View: {} - {} | {} - {}",
                         Self::format_axis_time_us(self.view_x_min_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                         Self::format_axis_time_us(self.view_x_max_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
-                        Self::format_bytes(self.view_y_min_bytes),
-                        Self::format_bytes(self.view_y_max_bytes),
+                        Self::format_bytes(self.view_y_min_bytes + self.memory_offset_bytes),
+                        Self::format_bytes(self.view_y_max_bytes + self.memory_offset_bytes),
                     ));
                 });
             });
@@ -1696,11 +1718,12 @@ impl eframe::App for MemoryVizApp {
                                 format!("| {}", shape),
                             );
                         }
+                        let off = self.memory_offset_bytes;
                         ui.label(format!(
                             "| Before alloc: {} | After alloc: {} | At dealloc: {}",
-                            Self::format_bytes(info.total_allocated_bytes as f64),
-                            Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64),
-                            Self::format_bytes(info.total_at_dealloc_bytes as f64),
+                            Self::format_bytes(info.total_allocated_bytes as f64 + off),
+                            Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64 + off),
+                            Self::format_bytes(info.total_at_dealloc_bytes as f64 + off),
                         ));
                         if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
                             let ann_label = ann.name.replace("##", "").trim().to_string();
@@ -1798,7 +1821,7 @@ impl eframe::App for MemoryVizApp {
                 painter.text(
                     egui::pos2(chart_rect.min.x - 6.0, y),
                     egui::Align2::RIGHT_CENTER,
-                    Self::format_bytes(val),
+                    Self::format_bytes(val + self.memory_offset_bytes),
                     egui::FontId::monospace(10.0),
                     egui::Color32::from_rgb(136, 136, 136),
                 );
@@ -1953,7 +1976,7 @@ impl eframe::App for MemoryVizApp {
 
             // GPU memory capacity line
             if let Some(capacity) = self.gpu_capacity_bytes {
-                let cap_y = bytes_to_screen_y(capacity);
+                let cap_y = bytes_to_screen_y(capacity - self.memory_offset_bytes);
                 if cap_y >= chart_rect.min.y && cap_y <= chart_rect.max.y {
                     let cap_color = egui::Color32::from_rgba_premultiplied(200, 50, 50, 140);
                     painter.line_segment(
@@ -2155,18 +2178,19 @@ impl eframe::App for MemoryVizApp {
                                     format!("Shape: {}", shape),
                                 );
                             }
+                            let off = self.memory_offset_bytes;
                             ui.label(format!(
                                 "Total before allocation: {}",
-                                Self::format_bytes(info.total_allocated_bytes as f64)
+                                Self::format_bytes(info.total_allocated_bytes as f64 + off)
                             ));
                             ui.label(format!(
                                 "Total after allocation: {}",
-                                Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64)
+                                Self::format_bytes((info.total_allocated_bytes + info.size_bytes) as f64 + off)
                             ));
                             if info.total_at_dealloc_bytes > 0 {
                                 ui.label(format!(
                                     "Total at deallocation: {}",
-                                    Self::format_bytes(info.total_at_dealloc_bytes as f64)
+                                    Self::format_bytes(info.total_at_dealloc_bytes as f64 + off)
                                 ));
                             }
                             if let Some(ann) = self.find_annotation_at(info.start_us as f64) {
@@ -2183,7 +2207,7 @@ impl eframe::App for MemoryVizApp {
                             ui.label(format!(
                                 "t = {} | mem = {}",
                                 Self::format_axis_time_us(rel_us, (self.view_x_max_us - self.view_x_min_us) / 10.0),
-                                Self::format_bytes(hover_bytes),
+                                Self::format_bytes(hover_bytes + self.memory_offset_bytes),
                             ));
                             if let Some(ann) = self.find_annotation_at(hover_us) {
                                 let ann_label = ann.name.replace("##", "").trim().to_string();
@@ -2255,7 +2279,11 @@ impl eframe::App for MemoryVizApp {
             let t_held = ui.input(|i| i.keys_down.contains(&egui::Key::T));
 
             if response.drag_started() {
-                if let Some(pos) = response.interact_pointer_pos() {
+                // Use press_origin for the start position so the ruler/selection
+                // begins exactly where the user clicked, not where the pointer
+                // is when the drag threshold is exceeded.
+                let origin = ui.input(|i| i.pointer.press_origin());
+                if let Some(pos) = origin {
                     if chart_rect.contains(pos) {
                         if cmd_held {
                             self.drag_select = Some(DragSelect {
@@ -2374,10 +2402,10 @@ impl eframe::App for MemoryVizApp {
 
             // Draw persistent rulers
             if let Some(ref ruler) = self.ruler {
-                Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
+                Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.memory_offset_bytes);
             }
             if let Some(ref hruler) = self.hruler {
-                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
+                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.time_min_us as f64);
             }
 
             // Dismiss rulers with Escape
@@ -2624,7 +2652,8 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let app = MemoryVizApp::new(layout, model_config, cli.quantized, cli.gpu);
+    let memory_offset_bytes = cli.offset * 1024.0 * 1024.0;
+    let app = MemoryVizApp::new(layout, model_config, cli.quantized, cli.gpu, memory_offset_bytes);
 
     eframe::run_native(
         "desktop-memory-viz",
