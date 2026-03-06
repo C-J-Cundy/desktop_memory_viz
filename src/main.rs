@@ -1389,6 +1389,7 @@ impl MemoryVizApp {
         bytes_to_screen_y: &dyn Fn(f64) -> f32,
         us_to_screen_x: &dyn Fn(f64) -> f32,
         chart_rect: egui::Rect,
+        time_min_us: f64,
     ) {
         let y = bytes_to_screen_y(hruler.y_bytes)
             .max(chart_rect.min.y)
@@ -1433,7 +1434,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x_left, y - tick_h - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            Self::format_time_us(hruler.x_min_us),
+            Self::format_time_us(hruler.x_min_us - time_min_us),
         );
 
         // Right tick + label
@@ -1448,7 +1449,7 @@ impl MemoryVizApp {
             painter,
             egui::pos2(x_right, y - tick_h - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            Self::format_time_us(hruler.x_max_us),
+            Self::format_time_us(hruler.x_max_us - time_min_us),
         );
 
         // Span label (centered above the line)
@@ -2404,7 +2405,7 @@ impl eframe::App for MemoryVizApp {
                 Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.memory_offset_bytes);
             }
             if let Some(ref hruler) = self.hruler {
-                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect);
+                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.time_min_us as f64);
             }
 
             // Dismiss rulers with Escape
