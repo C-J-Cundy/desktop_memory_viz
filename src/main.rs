@@ -1693,7 +1693,9 @@ impl eframe::App for MemoryVizApp {
         let time_min_us = self.layout.time_min_us as f64;
 
         egui::TopBottomPanel::bottom("hover_info")
-            .exact_height(100.0)
+            .resizable(true)
+            .default_height(150.0)
+            .height_range(60.0..=500.0)
             .show(ctx, |ui| {
                 if let Some(info) = &bottom_info {
                     ui.horizontal_wrapped(|ui| {
