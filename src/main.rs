@@ -1672,11 +1672,12 @@ impl eframe::App for MemoryVizApp {
             });
         });
 
-        // Ctrl+C to copy stack trace (from pinned info, or current hover)
+        // Cmd+C / Ctrl+C to copy stack trace (from pinned info, or current hover)
         let copy_source = self.last_hover_info.as_ref().or(self.hover_info.as_ref());
         if let Some(info) = copy_source {
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
-                ctx.copy_text(info.frame_str.clone());
+            let cmd = egui::Modifiers { command: true, ..Default::default() };
+            if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::C)) {
+                ctx.copy_text(info.frame_str.replace(" <- ", "\n"));
             }
         }
 
