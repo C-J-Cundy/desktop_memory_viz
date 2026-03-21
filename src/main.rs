@@ -1693,10 +1693,12 @@ impl eframe::App for MemoryVizApp {
         let time_min_us = self.layout.time_min_us as f64;
 
         egui::TopBottomPanel::bottom("hover_info")
-            .resizable(true)
-            .default_height(150.0)
-            .height_range(60.0..=500.0)
+            .exact_height(100.0)
             .show(ctx, |ui| {
+                // Always show the header row (fixed height) and scroll area below.
+                // When nothing is hovered, we show help text in the header area
+                // and an empty scroll area, so the panel layout stays stable.
+                let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
                 if let Some(info) = &bottom_info {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
@@ -1735,28 +1737,30 @@ impl eframe::App for MemoryVizApp {
                             );
                         }
                         if is_pinned {
-                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
                             ui.label(format!("| [pinned] Click empty to unpin | {} to copy", copy_hint));
                         } else {
-                            let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
                             ui.label(format!("| Click to pin | {} to copy", copy_hint));
                         }
                     });
-                    if !info.frame_str.is_empty() {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for frame in info.frame_str.split(" <- ") {
-                                ui.label(
-                                    egui::RichText::new(frame)
-                                        .small()
-                                        .color(egui::Color32::from_rgb(170, 170, 170)),
-                                );
-                            }
-                        });
-                    }
                 } else {
-                    let copy_hint = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
                     ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, R+Drag=vertical ruler, T+Drag=horizontal ruler (Esc=dismiss), Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
+                // Scrollable stack trace area always present so layout is stable.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(info) = &bottom_info {
+                            if !info.frame_str.is_empty() {
+                                for frame in info.frame_str.split(" <- ") {
+                                    ui.label(
+                                        egui::RichText::new(frame)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(170, 170, 170)),
+                                    );
+                                }
+                            }
+                        }
+                    });
             });
 
         // Central panel: the chart
