@@ -1745,22 +1745,33 @@ impl eframe::App for MemoryVizApp {
                 } else {
                     ui.label(format!("Hover over an allocation for details. Click=pin, Scroll=zoom XY, Shift+Scroll=zoom Y, Alt+Scroll=zoom X, Drag=pan, Cmd+Drag=select region, R+Drag=vertical ruler, T+Drag=horizontal ruler (Esc=dismiss), Double-click=fit Y, Right-click=dismiss tooltip, {}=copy.", copy_hint));
                 }
-                // Scrollable stack trace area always present so layout is stable.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if let Some(info) = &bottom_info {
-                            if !info.frame_str.is_empty() {
-                                for frame in info.frame_str.split(" <- ") {
-                                    ui.label(
-                                        egui::RichText::new(frame)
-                                            .small()
-                                            .color(egui::Color32::from_rgb(170, 170, 170)),
-                                    );
-                                }
+                if let Some(info) = &bottom_info {
+                    if !info.frame_str.is_empty() {
+                        if is_pinned {
+                            let remaining = ui.available_height();
+                            egui::ScrollArea::vertical()
+                                .max_height(remaining)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for frame in info.frame_str.split(" <- ") {
+                                        ui.label(
+                                            egui::RichText::new(frame)
+                                                .small()
+                                                .color(egui::Color32::from_rgb(170, 170, 170)),
+                                        );
+                                    }
+                                });
+                        } else {
+                            for frame in info.frame_str.split(" <- ") {
+                                ui.label(
+                                    egui::RichText::new(frame)
+                                        .small()
+                                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                                );
                             }
                         }
-                    });
+                    }
+                }
             });
 
         // Central panel: the chart
