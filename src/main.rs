@@ -1672,6 +1672,14 @@ impl eframe::App for MemoryVizApp {
             });
         });
 
+        // Ctrl+C to copy stack trace (from pinned info, or current hover)
+        let copy_source = self.last_hover_info.as_ref().or(self.hover_info.as_ref());
+        if let Some(info) = copy_source {
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+                ctx.copy_text(info.frame_str.clone());
+            }
+        }
+
         // Bottom panel: shows pinned allocation if set, otherwise current hover
         let is_pinned = self.last_hover_info.is_some();
         let bottom_info = if is_pinned {
@@ -2519,15 +2527,6 @@ impl eframe::App for MemoryVizApp {
                 }
             }
         });
-
-        // Cmd+C / Ctrl+C to copy full stack trace (runs last so no widget steals the event)
-        let copy_source = self.last_hover_info.as_ref().or(self.hover_info.as_ref());
-        if let Some(info) = copy_source {
-            let cmd = egui::Modifiers { command: true, ..Default::default() };
-            if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::C)) {
-                ctx.copy_text(info.frame_str.replace(" <- ", "\n"));
-            }
-        }
 
         // Request repaint when interacting
         if self.cache.is_none() {
