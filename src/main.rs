@@ -1750,6 +1750,7 @@ impl eframe::App for MemoryVizApp {
                         if is_pinned {
                             let remaining = ui.available_height();
                             egui::ScrollArea::vertical()
+                                .id_salt((info.start_us, info.size_bytes))
                                 .max_height(remaining)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
