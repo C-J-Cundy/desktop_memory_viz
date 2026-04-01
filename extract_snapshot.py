@@ -35,11 +35,11 @@ ACTION_CODES = {
 }
 
 
-def frame_summary(frames, max_frames=5):
+def frame_summary(frames):
     if not frames:
         return ""
     parts = []
-    for f in frames[:max_frames]:
+    for f in frames:
         filename = f.get("filename", "")
         short = filename.rsplit("/", 1)[-1] if "/" in filename else filename
         parts.append(f"{short}:{f.get('line', 0)} ({f.get('name', '')})")
