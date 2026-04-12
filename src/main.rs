@@ -2642,9 +2642,12 @@ fn main() -> Result<()> {
     );
 
     // Launch the egui window
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("Failed to load app icon");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
+            .with_icon(icon)
             .with_title(format!(
                 "CUDA Memory Timeline — {}",
                 cli.input.file_name().map(|f| f.to_string_lossy()).unwrap_or_default()
