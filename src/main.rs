@@ -46,6 +46,19 @@ struct Cli {
     #[arg(long, default_value = "false")]
     no_collapse_static_baselines: bool,
 
+    /// Only load events whose time_us is within this window, in seconds
+    /// from the trace's first event. Pair with --max-entries to render
+    /// every rect in a narrow window individually (e.g.
+    /// `--time-start-sec 12.5 --time-end-sec 13.5 --max-entries 1000000000`).
+    /// Annotations are clipped to the window; segments-derived `live_blocks`
+    /// are dropped when a window is set (they describe end-of-trace state).
+    #[arg(long)]
+    time_start_sec: Option<f64>,
+
+    /// See --time-start-sec.
+    #[arg(long)]
+    time_end_sec: Option<f64>,
+
     /// HuggingFace model ID (e.g., "google/gemma-2-2b"). Fetches config.json to
     /// get hidden_size and intermediate_size for tensor shape display.
     #[arg(long)]
@@ -2820,13 +2833,42 @@ fn main() -> Result<()> {
     let mut events = snapshot.events;
     events.sort_by_key(|e| e.3);
 
+    // Optional time-window filter. Events are kept only if their time_us
+    // falls in [trace_start + start_sec, trace_start + end_sec]. Annotations
+    // are clipped to the same window. live_blocks are dropped when a window
+    // is set (they describe state at the original snapshot's end, which is
+    // outside the window).
+    let mut annotations_raw = snapshot.annotations;
+    let mut live_blocks = snapshot.live_blocks;
+    if cli.time_start_sec.is_some() || cli.time_end_sec.is_some() {
+        let trace_start = events.first().map(|e| e.3).unwrap_or(0);
+        let lo = cli
+            .time_start_sec
+            .map(|s| trace_start + (s * 1e6) as i64)
+            .unwrap_or(i64::MIN);
+        let hi = cli
+            .time_end_sec
+            .map(|s| trace_start + (s * 1e6) as i64)
+            .unwrap_or(i64::MAX);
+        let before = events.len();
+        events.retain(|e| e.3 >= lo && e.3 <= hi);
+        annotations_raw.retain(|a| a.time_us >= lo && a.time_us <= hi);
+        live_blocks.clear();
+        eprintln!(
+            "  time-window filter: kept {} of {} events ({} ann)",
+            events.len(),
+            before,
+            annotations_raw.len()
+        );
+    }
+
     let time_min = events.first().map(|e| e.3).unwrap_or(0);
     let time_max = events.last().map(|e| e.3).unwrap_or(0);
 
     // Pair alloc/free events
     eprintln!("Pairing alloc/free events...");
     let t_pair = Instant::now();
-    let rects = pair_alloc_free(&events, time_max, &snapshot.live_blocks);
+    let rects = pair_alloc_free(&events, time_max, &live_blocks);
     eprintln!(
         "  {} allocation rectangles in {:.1}s",
         rects.len(),
@@ -2835,7 +2877,7 @@ fn main() -> Result<()> {
 
     // Pair annotations
     let annotations = pair_annotations(
-        &snapshot.annotations,
+        &annotations_raw,
         &cli.annotation_filter,
         cli.all_annotations,
     );
