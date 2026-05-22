@@ -8,6 +8,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+mod pickle;
+
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 // ── CLI ─────────────────────────────────────────────────────────────
 
 /// Native GPU-accelerated CUDA memory snapshot visualizer.
@@ -32,6 +38,26 @@ struct Cli {
     /// Maximum number of allocations to render individually (rest are summarized)
     #[arg(long, default_value = "1000000000")]
     max_entries: usize,
+
+    /// Render each segments-derived static baseline as a separate rect instead
+    /// of collapsing them all into one. Default behavior collapses ~300K
+    /// allocations that were live before recording started into a single
+    /// bottom-band block (with an explanatory tooltip) for performance.
+    #[arg(long, default_value = "false")]
+    no_collapse_static_baselines: bool,
+
+    /// Only load events whose time_us is within this window, in seconds
+    /// from the trace's first event. Pair with --max-entries to render
+    /// every rect in a narrow window individually (e.g.
+    /// `--time-start-sec 12.5 --time-end-sec 13.5 --max-entries 1000000000`).
+    /// Annotations are clipped to the window; segments-derived `live_blocks`
+    /// are dropped when a window is set (they describe end-of-trace state).
+    #[arg(long)]
+    time_start_sec: Option<f64>,
+
+    /// See --time-start-sec.
+    #[arg(long)]
+    time_end_sec: Option<f64>,
 
     /// HuggingFace model ID (e.g., "google/gemma-2-2b"). Fetches config.json to
     /// get hidden_size and intermediate_size for tensor shape display.
@@ -178,6 +204,11 @@ struct SnapshotJson {
     events: Vec<(u8, u64, u64, i64, u32)>,
     frame_strings: Vec<String>,
     annotations: Vec<JsonAnnotation>,
+    /// (address, size) for blocks live at snapshot time that were never
+    /// alloc'd during the recording. Added by the Rust pickle parser; the
+    /// older Python extractor doesn't write this field.
+    #[serde(default)]
+    live_blocks: Vec<(u64, u64)>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +225,13 @@ struct AllocRect {
     start_us: i64,
     end_us: i64,
     frame_idx: u32,
+    /// True for rects synthesized from `segments[*].blocks` data — they
+    /// represent allocations that were live before the recording window
+    /// started AND persisted through it. They never participate in the
+    /// polygon-layout shift loop because they never free during the trace,
+    /// which lets `build_polygon_layout` pre-emit them as static bottom-band
+    /// polygons and skip them from the O(n·k) event sweep.
+    is_static_baseline: bool,
 }
 
 // ── Paired annotation ───────────────────────────────────────────────
@@ -206,14 +244,25 @@ struct PairedAnnotation {
 
 // ── Pair alloc/free events into rectangles ──────────────────────────
 
-fn pair_alloc_free(events: &[(u8, u64, u64, i64, u32)], last_time: i64) -> Vec<AllocRect> {
+fn pair_alloc_free(
+    events: &[(u8, u64, u64, i64, u32)],
+    last_time: i64,
+    live_blocks: &[(u64, u64)],
+) -> Vec<AllocRect> {
     let mut live: HashMap<u64, (u64, i64, u32)> = HashMap::new();
     let mut rects: Vec<AllocRect> = Vec::new();
+
+    // Truncated profiles can begin with free events for memory allocated
+    // *before* the recording window. Treat the first free for an unseen
+    // address as if it had been allocated at the trace start.
+    let first_time = events.first().map(|e| e.3).unwrap_or(0);
+    let mut ever_seen: HashSet<u64> = HashSet::new();
 
     for &(action, addr, size, time_us, frame_idx) in events {
         match action {
             0 => {
                 // alloc
+                ever_seen.insert(addr);
                 live.insert(addr, (size, time_us, frame_idx));
             }
             1 | 2 => {
@@ -225,9 +274,24 @@ fn pair_alloc_free(events: &[(u8, u64, u64, i64, u32)], last_time: i64) -> Vec<A
                             start_us,
                             end_us: time_us,
                             frame_idx: alloc_frame,
+                            is_static_baseline: false,
                         });
                     }
+                } else if ever_seen.insert(addr) {
+                    // First time we've ever seen this address and it isn't
+                    // live: it must have been alloc'd before the recording
+                    // window started. Synthesize a baseline rect.
+                    rects.push(AllocRect {
+                        size,
+                        start_us: first_time,
+                        end_us: time_us,
+                        frame_idx,
+                        is_static_baseline: false,
+                    });
                 }
+                // else: redundant free for an addr we've already accounted
+                // for (e.g., the free_completed half of an alloc/free pair,
+                // or a second free for an already-synthesized baseline).
             }
             _ => {
                 // segment events — skip
@@ -242,6 +306,24 @@ fn pair_alloc_free(events: &[(u8, u64, u64, i64, u32)], last_time: i64) -> Vec<A
             start_us,
             end_us: last_time,
             frame_idx,
+            is_static_baseline: false,
+        });
+    }
+
+    // Segments-derived baselines: live before recording started AND still
+    // live at snapshot time. Synthesize a rect spanning the entire trace.
+    // Marked is_static_baseline so build_polygon_layout can pre-emit them
+    // as bottom-band polygons and skip them from the event sweep.
+    for &(_addr, size) in live_blocks {
+        if size == 0 {
+            continue;
+        }
+        rects.push(AllocRect {
+            size,
+            start_us: first_time,
+            end_us: last_time,
+            frame_idx: 0,
+            is_static_baseline: true,
         });
     }
 
@@ -377,10 +459,59 @@ fn convert_pickle_to_json(pickle_path: &PathBuf) -> Result<PathBuf> {
 struct AllocPolygon {
     rect_idx: u32,
     size: u64,
-    /// Parallel arrays: at times_us[i], the y_offset is offsets[i].
-    times_us: Vec<i64>,
-    offsets: Vec<f64>,
+    /// Parallel arrays:
+    /// - `times_us[i]`: i32 packed time relative to the layout's `time_min_us`,
+    ///   in units of 10 µs (multiply by 10 and add base to recover µs).
+    /// - `offsets[i]`: u32 KiB (multiply by 1024 to recover bytes).
+    ///
+    /// Both arrays are quantized to halve the persistent footprint. The
+    /// build pass keeps an exact f64-bytes parallel tracker so that
+    /// repeated shifts don't compound rounding errors in the stored
+    /// offsets. Times are quantized by truncation, which can collapse
+    /// shifts that fall within the same 10 µs bucket — invisible at any
+    /// practical zoom level (10 µs ≪ pixel width).
+    times_us: Vec<i32>,
+    offsets: Vec<u32>,
     color: egui::Color32,
+}
+
+/// Convert a byte offset to the u32-KiB representation used in AllocPolygon.
+#[inline]
+fn offset_bytes_to_kib(bytes: f64) -> u32 {
+    (bytes / 1024.0).round().max(0.0) as u32
+}
+
+/// Convert a stored u32-KiB offset back to bytes (as f64) for rendering or
+/// hover math.
+#[inline]
+fn offset_kib_to_bytes(kib: u32) -> f64 {
+    kib as f64 * 1024.0
+}
+
+/// Number of microseconds per packed time-unit in AllocPolygon.times_us.
+const TIME_QUANTUM_US: i64 = 10;
+
+/// Pack an absolute µs timestamp into the i32 representation used in
+/// AllocPolygon.times_us (10 µs units relative to `base`). Uses round-to-
+/// nearest for evenness.
+#[inline]
+fn time_us_to_packed(t_us: i64, base: i64) -> i32 {
+    let rel = t_us - base;
+    // Round-to-nearest (banker's-style isn't necessary for visual quantization).
+    let half = TIME_QUANTUM_US / 2;
+    let q = if rel >= 0 {
+        (rel + half) / TIME_QUANTUM_US
+    } else {
+        (rel - half) / TIME_QUANTUM_US
+    };
+    q.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Unpack an AllocPolygon.times_us entry back to absolute µs as f64 for
+/// rendering math.
+#[inline]
+fn time_packed_to_us_f64(p: i32, base: i64) -> f64 {
+    (base + (p as i64) * TIME_QUANTUM_US) as f64
 }
 
 /// Summarized band for untracked (small) allocations.
@@ -407,9 +538,16 @@ struct PolygonLayout {
     frame_strings: Vec<String>,
     /// Paired annotations.
     annotations: Vec<PairedAnnotation>,
-    /// Time range in microseconds.
+    /// Time range in microseconds (of the events that were actually loaded,
+    /// i.e. post-filter).
     time_min_us: i64,
     time_max_us: i64,
+    /// Origin used for axis-label display: the time_us of the first event in
+    /// the *original* trace, before any --time-start-sec window was applied.
+    /// Equals `time_min_us` when no window is active. Labels are computed as
+    /// `(val - display_origin_us) / 1e6` so that a filtered view at 12.5s
+    /// shows "12.5s" at the left edge rather than "0s".
+    display_origin_us: i64,
     /// Peak total memory (tracked + summarized).
     peak_bytes: u64,
     /// Stats.
@@ -426,29 +564,70 @@ struct PolygonLayout {
 /// 4. On free of tracked: remove, shift all above down by freed size
 /// 5. On alloc/free of untracked: adjust summarized band
 fn build_polygon_layout(
-    rects: Vec<AllocRect>,
-    frame_strings: Vec<String>,
+    mut rects: Vec<AllocRect>,
+    mut frame_strings: Vec<String>,
     annotations: Vec<PairedAnnotation>,
     time_min_us: i64,
     time_max_us: i64,
+    display_origin_us: i64,
     total_events: usize,
     max_entries: usize,
+    collapse_static_baselines: bool,
 ) -> PolygonLayout {
+    // Optionally collapse all static-baseline rects into a single merged
+    // rect with an explanatory tooltip. The default is on because there are
+    // typically ~hundreds of thousands of these and rendering them individually
+    // can be slow.
+    if collapse_static_baselines {
+        let mut total_size: u64 = 0;
+        let mut count: usize = 0;
+        for r in &rects {
+            if r.is_static_baseline {
+                total_size = total_size.saturating_add(r.size);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            rects.retain(|r| !r.is_static_baseline);
+            let frame_idx = frame_strings.len() as u32;
+            frame_strings.push(format!(
+                "{} static-baseline allocations (totaling {:.2} GB) collapsed. \
+                 Relaunch with --no-collapse-static-baselines to render individually.",
+                count,
+                total_size as f64 / 1e9
+            ));
+            rects.push(AllocRect {
+                size: total_size,
+                start_us: time_min_us,
+                end_us: time_max_us,
+                frame_idx,
+                is_static_baseline: true,
+            });
+        }
+    }
     let total_rects = rects.len();
 
-    // 1. Select top max_entries allocations by size
+    // 1. Select top max_entries allocations by size. Static-baseline rects
+    //    are ALWAYS tracked (they're cheap: 2 polygon-history entries each
+    //    and they never participate in the shift loop).
     let mut by_size: Vec<(u64, u32)> = rects
         .iter()
         .enumerate()
+        .filter(|(_, r)| !r.is_static_baseline)
         .map(|(i, r)| (r.size, i as u32))
         .collect();
     by_size.sort_unstable_by(|a, b| b.0.cmp(&a.0)); // largest first
 
-    let tracked: HashSet<u32> = by_size
+    let mut tracked: HashSet<u32> = by_size
         .iter()
         .take(max_entries)
         .map(|&(_, idx)| idx)
         .collect();
+    for (i, r) in rects.iter().enumerate() {
+        if r.is_static_baseline {
+            tracked.insert(i as u32);
+        }
+    }
 
     let tracked_count = tracked.len();
     let summarized_count = total_rects - tracked_count;
@@ -457,25 +636,62 @@ fn build_polygon_layout(
         tracked_count, summarized_count
     );
 
-    // 2. Build sorted event list
+    // 2. Pre-emit polygons for static baselines: each is a constant-offset
+    //    rect from first_time to last_time. They stack at the bottom in
+    //    iteration order and never move (nothing below them ever frees).
     let n = rects.len();
+    let mut polygons: Vec<AllocPolygon> = Vec::with_capacity(tracked_count);
+    let mut polygon_map: HashMap<u32, usize> = HashMap::new();
+    let mut rect_to_poly: Vec<u32> = vec![u32::MAX; n];
+    let mut total_mem: f64 = 0.0;
+    // Parallel to `polygons`: stores each polygon's current y-offset in bytes
+    // (f64, exact). The persistent offsets array on AllocPolygon is u32 KiB
+    // (lossy). Keeping an exact byte-precision tracker during the build pass
+    // means each new entry pushed to AllocPolygon.offsets is derived from the
+    // true running total — not from the previously-quantized value — so
+    // rounding errors do NOT compound across shifts.
+    let mut polygon_offset_bytes: Vec<f64> = Vec::with_capacity(tracked_count);
+
+    for (i, r) in rects.iter().enumerate() {
+        if !r.is_static_baseline {
+            continue;
+        }
+        let poly_idx = polygons.len();
+        let kib = offset_bytes_to_kib(total_mem);
+        polygons.push(AllocPolygon {
+            rect_idx: i as u32,
+            size: r.size,
+            times_us: vec![
+                time_us_to_packed(r.start_us, time_min_us),
+                time_us_to_packed(r.end_us, time_min_us),
+            ],
+            offsets: vec![kib, kib],
+            color: alloc_color(i as u32),
+        });
+        polygon_offset_bytes.push(total_mem);
+        polygon_map.insert(i as u32, poly_idx);
+        rect_to_poly[i] = poly_idx as u32;
+        total_mem += r.size as f64;
+    }
+    let static_baseline_offset = total_mem;
+
+    // 3. Build sorted event list ONLY for non-static rects (static baselines
+    //    are already emitted; including them here would put them on `current`
+    //    and force every shift loop to scan past them).
     let mut sorted_events: Vec<(i64, u8, u32)> = Vec::with_capacity(n * 2);
     for (i, r) in rects.iter().enumerate() {
+        if r.is_static_baseline {
+            continue;
+        }
         sorted_events.push((r.start_us, 1, i as u32)); // alloc
         sorted_events.push((r.end_us, 0, i as u32)); // free
     }
-    // Sort by time; at same time, allocs before frees (type 1 > type 0, so reverse)
     sorted_events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
 
-    // 3. Process events in time order
-    let mut current: Vec<u32> = Vec::new(); // ordered stack of tracked rect_idxs
-    let mut polygon_map: HashMap<u32, usize> = HashMap::new(); // rect_idx -> index in polygons vec
-    let mut polygons: Vec<AllocPolygon> = Vec::with_capacity(tracked_count);
-    let mut rect_to_poly: Vec<u32> = vec![u32::MAX; n];
-
-    let mut total_mem: f64 = 0.0; // sum of tracked live allocations
+    // 4. Process events in time order
+    let mut current: Vec<u32> = Vec::new(); // ordered stack of tracked dynamic rect_idxs
     let mut total_summarized_mem: f64 = 0.0;
-    let mut peak: f64 = 0.0;
+    let mut peak: f64 = static_baseline_offset;
 
     let mut summarized = SummarizedBand {
         times_us: Vec::new(),
@@ -532,10 +748,11 @@ fn build_polygon_layout(
                 polygons.push(AllocPolygon {
                     rect_idx,
                     size: rects[rect_idx as usize].size,
-                    times_us: vec![time_us],
-                    offsets: vec![total_mem],
+                    times_us: vec![time_us_to_packed(time_us, time_min_us)],
+                    offsets: vec![offset_bytes_to_kib(total_mem)],
                     color: alloc_color(rect_idx),
                 });
+                polygon_offset_bytes.push(total_mem);
                 polygon_map.insert(rect_idx, poly_idx);
                 rect_to_poly[rect_idx as usize] = poly_idx as u32;
                 total_mem += size;
@@ -549,11 +766,12 @@ fn build_polygon_layout(
             0 => {
                 // Free: find in current, remove, shift above down
                 if let Some(stack_idx) = current.iter().rposition(|&x| x == rect_idx) {
+                    let packed_t = time_us_to_packed(time_us, time_min_us);
                     // Record final position for freed allocation
                     if let Some(&poly_idx) = polygon_map.get(&rect_idx) {
-                        let last_offset = *polygons[poly_idx].offsets.last().unwrap_or(&0.0);
-                        polygons[poly_idx].times_us.push(time_us);
-                        polygons[poly_idx].offsets.push(last_offset);
+                        let last_bytes = polygon_offset_bytes[poly_idx];
+                        polygons[poly_idx].times_us.push(packed_t);
+                        polygons[poly_idx].offsets.push(offset_bytes_to_kib(last_bytes));
                     }
 
                     current.remove(stack_idx);
@@ -562,14 +780,17 @@ fn build_polygon_layout(
                     for j in stack_idx..current.len() {
                         let above_rect_idx = current[j];
                         if let Some(&poly_idx) = polygon_map.get(&above_rect_idx) {
-                            let last_offset =
-                                *polygons[poly_idx].offsets.last().unwrap_or(&0.0);
+                            // Read exact byte offset (NOT the quantized one)
+                            let last_bytes = polygon_offset_bytes[poly_idx];
+                            let new_bytes = last_bytes - size;
                             // Record old position
-                            polygons[poly_idx].times_us.push(time_us);
-                            polygons[poly_idx].offsets.push(last_offset);
+                            polygons[poly_idx].times_us.push(packed_t);
+                            polygons[poly_idx].offsets.push(offset_bytes_to_kib(last_bytes));
                             // Record new position (shifted down)
-                            polygons[poly_idx].times_us.push(time_us);
-                            polygons[poly_idx].offsets.push(last_offset - size);
+                            polygons[poly_idx].times_us.push(packed_t);
+                            polygons[poly_idx].offsets.push(offset_bytes_to_kib(new_bytes));
+                            // Update the exact tracker
+                            polygon_offset_bytes[poly_idx] = new_bytes;
                         }
                     }
 
@@ -592,11 +813,12 @@ fn build_polygon_layout(
     }
 
     // Finalize: extend all live tracked allocations to end time
+    let packed_end = time_us_to_packed(time_max_us, time_min_us);
     for &rect_idx in &current {
         if let Some(&poly_idx) = polygon_map.get(&rect_idx) {
-            let last_offset = *polygons[poly_idx].offsets.last().unwrap_or(&0.0);
-            polygons[poly_idx].times_us.push(time_max_us);
-            polygons[poly_idx].offsets.push(last_offset);
+            let last_bytes = polygon_offset_bytes[poly_idx];
+            polygons[poly_idx].times_us.push(packed_end);
+            polygons[poly_idx].offsets.push(offset_bytes_to_kib(last_bytes));
         }
     }
     // Final summarized state
@@ -622,6 +844,7 @@ fn build_polygon_layout(
         annotations,
         time_min_us,
         time_max_us,
+        display_origin_us,
         peak_bytes: peak as u64,
         total_events,
         total_rects,
@@ -748,6 +971,13 @@ fn build_view_cache(
         };
 
     // Paint each tracked polygon
+    let base_us = layout.time_min_us;
+    // Convert view bounds into packed-time units for cheap comparisons against
+    // the i32 times array.
+    let view_min_packed: i32 = {
+        let q = ((view_x_min_us - base_us as f64) / TIME_QUANTUM_US as f64).floor();
+        q.clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    };
     for poly in &layout.polygons {
         let size = poly.size as f64;
         let times = &poly.times_us;
@@ -757,12 +987,12 @@ fn build_view_cache(
         }
 
         // Binary search for first entry with time >= view_x_min
-        let start_idx = times.partition_point(|&t| (t as f64) < view_x_min_us);
+        let start_idx = times.partition_point(|&t| t < view_min_packed);
         let start_idx = if start_idx > 0 { start_idx - 1 } else { 0 };
 
         for i in start_idx..times.len().saturating_sub(1) {
-            let t0 = times[i] as f64;
-            let t1 = times[i + 1] as f64;
+            let t0 = time_packed_to_us_f64(times[i], base_us);
+            let t1 = time_packed_to_us_f64(times[i + 1], base_us);
 
             if t1 <= view_x_min_us {
                 continue;
@@ -771,7 +1001,7 @@ fn build_view_cache(
                 break;
             }
 
-            let offset = offsets[i];
+            let offset = offset_kib_to_bytes(offsets[i]);
             let y_bottom = offset;
             let y_top = offset + size;
 
@@ -1663,8 +1893,8 @@ impl eframe::App for MemoryVizApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "View: {} - {} | {} - {}",
-                        Self::format_axis_time_us(self.view_x_min_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
-                        Self::format_axis_time_us(self.view_x_max_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_min_us - self.layout.display_origin_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_max_us - self.layout.display_origin_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                         Self::format_bytes(self.view_y_min_bytes + self.memory_offset_bytes),
                         Self::format_bytes(self.view_y_max_bytes + self.memory_offset_bytes),
                     ));
@@ -1690,7 +1920,7 @@ impl eframe::App for MemoryVizApp {
         let shape_str = bottom_info
             .as_ref()
             .and_then(|info| self.format_tensor_shape(info.size_bytes));
-        let time_min_us = self.layout.time_min_us as f64;
+        let time_min_us = self.layout.display_origin_us as f64;
 
         egui::TopBottomPanel::bottom("hover_info")
             .exact_height(100.0)
@@ -1856,7 +2086,7 @@ impl eframe::App for MemoryVizApp {
                     egui::Stroke::new(0.5, grid_color),
                 );
                 let val = vx_min + frac as f64 * x_range;
-                let relative = val - self.layout.time_min_us as f64;
+                let relative = val - self.layout.display_origin_us as f64;
                 painter.text(
                     egui::pos2(x, chart_rect.max.y + 6.0),
                     egui::Align2::CENTER_TOP,
@@ -2030,17 +2260,20 @@ impl eframe::App for MemoryVizApp {
                         return;
                     }
                     let mut points: Vec<egui::Pos2> = Vec::with_capacity(n * 4);
+                    let base_us = self.layout.time_min_us;
                     for i in 0..n - 1 {
-                        let x0 = us_to_screen_x(poly.times_us[i] as f64);
-                        let x1 = us_to_screen_x(poly.times_us[i + 1] as f64);
-                        let y = bytes_to_screen_y(poly.offsets[i]);
+                        let x0 = us_to_screen_x(time_packed_to_us_f64(poly.times_us[i], base_us));
+                        let x1 =
+                            us_to_screen_x(time_packed_to_us_f64(poly.times_us[i + 1], base_us));
+                        let y = bytes_to_screen_y(offset_kib_to_bytes(poly.offsets[i]));
                         points.push(egui::pos2(x0, y));
                         points.push(egui::pos2(x1, y));
                     }
                     for i in (0..n - 1).rev() {
-                        let x0 = us_to_screen_x(poly.times_us[i + 1] as f64);
-                        let x1 = us_to_screen_x(poly.times_us[i] as f64);
-                        let y = bytes_to_screen_y(poly.offsets[i] + size);
+                        let x0 =
+                            us_to_screen_x(time_packed_to_us_f64(poly.times_us[i + 1], base_us));
+                        let x1 = us_to_screen_x(time_packed_to_us_f64(poly.times_us[i], base_us));
+                        let y = bytes_to_screen_y(offset_kib_to_bytes(poly.offsets[i]) + size);
                         points.push(egui::pos2(x0, y));
                         points.push(egui::pos2(x1, y));
                     }
@@ -2116,17 +2349,28 @@ impl eframe::App for MemoryVizApp {
                                         if poly_idx != u32::MAX {
                                             let poly =
                                                 &self.layout.polygons[poly_idx as usize];
+                                            let base_us = self.layout.time_min_us;
+                                            let hover_packed: i32 = {
+                                                let q = ((hover_us - base_us as f64)
+                                                    / TIME_QUANTUM_US as f64)
+                                                    .floor();
+                                                q.clamp(i32::MIN as f64, i32::MAX as f64) as i32
+                                            };
                                             let time_idx = poly
                                                 .times_us
-                                                .partition_point(|&t| (t as f64) <= hover_us);
+                                                .partition_point(|&t| t <= hover_packed);
                                             let seg_idx = if time_idx > 0 {
                                                 time_idx - 1
                                             } else {
                                                 0
                                             };
-                                            let offset = poly.offsets[seg_idx] as u64;
-                                            let last_offset = *poly.offsets.last().unwrap_or(&0.0);
-                                            let dealloc_total = (last_offset + r.size as f64) as u64;
+                                            let offset =
+                                                offset_kib_to_bytes(poly.offsets[seg_idx]) as u64;
+                                            let last_offset = offset_kib_to_bytes(
+                                                *poly.offsets.last().unwrap_or(&0),
+                                            );
+                                            let dealloc_total =
+                                                (last_offset + r.size as f64) as u64;
                                             (offset, dealloc_total)
                                         } else {
                                             (0, 0)
@@ -2182,11 +2426,11 @@ impl eframe::App for MemoryVizApp {
                             ui.label(format!(
                                 "Time: {} - {}",
                                 Self::format_axis_time_us(
-                                    info.start_us as f64 - self.layout.time_min_us as f64,
+                                    info.start_us as f64 - self.layout.display_origin_us as f64,
                                     tick_sp,
                                 ),
                                 Self::format_axis_time_us(
-                                    info.end_us as f64 - self.layout.time_min_us as f64,
+                                    info.end_us as f64 - self.layout.display_origin_us as f64,
                                     tick_sp,
                                 ),
                             ));
@@ -2220,7 +2464,7 @@ impl eframe::App for MemoryVizApp {
                             }
                         });
                     } else if !self.tooltip_dismissed {
-                        let rel_us = hover_us - self.layout.time_min_us as f64;
+                        let rel_us = hover_us - self.layout.display_origin_us as f64;
                         egui::show_tooltip_at_pointer(ctx, response.layer_id, egui::Id::new("cursor_tooltip"), |ui| {
                             ui.label(format!(
                                 "t = {} | mem = {}",
@@ -2423,7 +2667,7 @@ impl eframe::App for MemoryVizApp {
                 Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.memory_offset_bytes);
             }
             if let Some(ref hruler) = self.hruler {
-                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.time_min_us as f64);
+                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.display_origin_us as f64);
             }
 
             // Dismiss rulers with Escape
@@ -2548,6 +2792,9 @@ fn format_count(n: usize) -> String {
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    #[cfg(feature = "heap-profile")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
     let start = Instant::now();
 
@@ -2595,13 +2842,76 @@ fn main() -> Result<()> {
     let mut events = snapshot.events;
     events.sort_by_key(|e| e.3);
 
+    // Optional time-window filter. Events are kept only if their time_us
+    // falls in [trace_start + start_sec, trace_start + end_sec]. Annotations
+    // are clipped to the same window. live_blocks are dropped when a window
+    // is set (they describe state at the original snapshot's end, which is
+    // outside the window).
+    let mut annotations_raw = snapshot.annotations;
+    let mut live_blocks = snapshot.live_blocks;
+    // Capture the original trace's first event time BEFORE any filtering, so
+    // axis labels remain anchored to it (a windowed view at 12.5s shows
+    // "12.5s" at the left edge instead of "0s").
+    let original_trace_start = events.first().map(|e| e.3).unwrap_or(0);
+    if cli.time_start_sec.is_some() || cli.time_end_sec.is_some() {
+        let trace_start = original_trace_start;
+        let lo = cli
+            .time_start_sec
+            .map(|s| trace_start + (s * 1e6) as i64)
+            .unwrap_or(i64::MIN);
+        let hi = cli
+            .time_end_sec
+            .map(|s| trace_start + (s * 1e6) as i64)
+            .unwrap_or(i64::MAX);
+        let before = events.len();
+
+        // Pre-pass: walk events strictly before `lo` to find allocations
+        // that were live at the start of the window (alloc'd but not yet
+        // freed). Feed them into `live_blocks` so they're rendered via the
+        // segments-style static-baseline path (a single collapsed bottom
+        // block by default, optionally per-rect via
+        // --no-collapse-static-baselines). This trades baseline detail
+        // (we no longer show baseline frees within the window) for
+        // dramatically less work in build_polygon_layout.
+        let mut live_at_start: HashMap<u64, u64> = HashMap::new();
+        for &(action, addr, size, time_us, _frame_idx) in events.iter() {
+            if time_us >= lo {
+                break;
+            }
+            match action {
+                0 => {
+                    live_at_start.insert(addr, size);
+                }
+                1 | 2 => {
+                    live_at_start.remove(&addr);
+                }
+                _ => {}
+            }
+        }
+
+        events.retain(|e| e.3 >= lo && e.3 <= hi);
+        annotations_raw.retain(|a| a.time_us >= lo && a.time_us <= hi);
+        live_blocks.clear();
+        let n_baselines = live_at_start.len();
+        for (addr, size) in live_at_start {
+            live_blocks.push((addr, size));
+        }
+        eprintln!(
+            "  time-window filter: kept {} of {} events ({} ann); {} live-at-window-start allocs added as static baselines",
+            events.len(),
+            before,
+            annotations_raw.len(),
+            n_baselines,
+        );
+    }
+
     let time_min = events.first().map(|e| e.3).unwrap_or(0);
     let time_max = events.last().map(|e| e.3).unwrap_or(0);
 
     // Pair alloc/free events
     eprintln!("Pairing alloc/free events...");
     let t_pair = Instant::now();
-    let rects = pair_alloc_free(&events, time_max);
+    let rects = pair_alloc_free(&events, time_max, &live_blocks);
     eprintln!(
         "  {} allocation rectangles in {:.1}s",
         rects.len(),
@@ -2610,7 +2920,7 @@ fn main() -> Result<()> {
 
     // Pair annotations
     let annotations = pair_annotations(
-        &snapshot.annotations,
+        &annotations_raw,
         &cli.annotation_filter,
         cli.all_annotations,
     );
@@ -2628,8 +2938,10 @@ fn main() -> Result<()> {
         annotations,
         time_min,
         time_max,
+        original_trace_start,
         total_events,
         cli.max_entries,
+        !cli.no_collapse_static_baselines,
     );
     eprintln!(
         "  Layout built in {:.1}s",
@@ -2640,6 +2952,19 @@ fn main() -> Result<()> {
         "Total data loading: {:.1}s. Launching GUI...",
         start.elapsed().as_secs_f64()
     );
+
+    #[cfg(feature = "heap-profile")]
+    {
+        // Exit before run_native so the dhat snapshot captures the post-layout
+        // heap state without GUI rendering allocations mixed in. Layout is
+        // still live at this point — it will be dropped at function return,
+        // after the dhat Profiler's Drop writes dhat-heap.json.
+        eprintln!(
+            "[heap-profile] polygons={} | exiting before GUI to dump dhat snapshot",
+            layout.polygons.len()
+        );
+        return Ok(());
+    }
 
     // Launch the egui window
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -2684,4 +3009,98 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_alloc_synthesized_for_pre_window_frees() {
+        // Trace: free for addr 0xA (no prior alloc) + normal alloc/free for addr 0xB.
+        // (action 0=alloc, 1=free_requested, 2=free_completed)
+        let events: Vec<(u8, u64, u64, i64, u32)> = vec![
+            // first event is a free_completed for 0xA — baseline
+            (2, 0xA, 360_192, 100, 7),
+            // normal: alloc + free pair for 0xB
+            (0, 0xB, 512, 110, 3),
+            (1, 0xB, 512, 200, 3),
+            // a free for an addr we already accounted for as baseline:
+            // free_requested followed by free_completed in some real traces.
+            // Only the first free for 0xA should synthesize a rect; the
+            // second should be ignored.
+            (1, 0xA, 360_192, 250, 7),
+        ];
+        let rects = pair_alloc_free(&events, 1000, &[]);
+        // Expect: one baseline rect for 0xA (starts at first_time=100, ends at 100 — the free's time)
+        // plus one normal rect for 0xB.
+        let baseline_rects: Vec<_> = rects.iter().filter(|r| r.start_us == 100).collect();
+        let normal_rects: Vec<_> = rects.iter().filter(|r| r.start_us != 100).collect();
+        // Note: the FIRST free for 0xA is the very first event, so its time_us
+        // equals first_time; the rect would have zero width. Verify count:
+        assert_eq!(baseline_rects.len(), 1, "expected exactly one baseline rect");
+        assert_eq!(baseline_rects[0].size, 360_192);
+        assert_eq!(baseline_rects[0].frame_idx, 7);
+        // The normal alloc/free pair produces one rect.
+        let normal_rect = normal_rects
+            .iter()
+            .find(|r| r.size == 512)
+            .expect("missing normal rect");
+        assert_eq!(normal_rect.start_us, 110);
+        assert_eq!(normal_rect.end_us, 200);
+    }
+
+    #[test]
+    fn second_free_for_same_baseline_addr_does_not_double_count() {
+        // free_requested then free_completed for the SAME pre-window addr.
+        // Only one baseline rect should be synthesized.
+        let events: Vec<(u8, u64, u64, i64, u32)> = vec![
+            (1, 0xC, 1024, 100, 0), // free_requested
+            (2, 0xC, 1024, 101, 0), // free_completed — must NOT create another rect
+        ];
+        let rects = pair_alloc_free(&events, 1000, &[]);
+        assert_eq!(rects.len(), 1, "expected exactly one rect for the addr");
+        assert_eq!(rects[0].size, 1024);
+    }
+
+    #[test]
+    fn live_blocks_produce_full_trace_baseline_rects() {
+        // live_blocks represents allocations that pre-dated the recording
+        // window AND persisted throughout. Synthesize a rect spanning
+        // (first_time, last_time) for each.
+        let events: Vec<(u8, u64, u64, i64, u32)> = vec![
+            (0, 0xE, 4096, 100, 0), // one in-window alloc
+            (1, 0xE, 4096, 200, 0),
+        ];
+        let live_blocks = vec![(0xF000_u64, 1024_u64), (0xF400_u64, 2048_u64)];
+        let rects = pair_alloc_free(&events, 999, &live_blocks);
+        // Expect 1 normal rect + 2 live_blocks rects = 3 total.
+        assert_eq!(rects.len(), 3, "expected 1 in-window + 2 live_blocks rects");
+        let baselines: Vec<_> = rects
+            .iter()
+            .filter(|r| r.start_us == 100 && r.end_us == 999)
+            .collect();
+        assert_eq!(baselines.len(), 2);
+        let total_baseline: u64 = baselines.iter().map(|r| r.size).sum();
+        assert_eq!(total_baseline, 1024 + 2048);
+    }
+
+    #[test]
+    fn normal_alloc_free_pair_does_not_spuriously_create_baseline() {
+        // Bug we fixed: free_completed after a successful free_requested
+        // used to fall into the baseline branch and create a spurious rect.
+        let events: Vec<(u8, u64, u64, i64, u32)> = vec![
+            (0, 0xD, 2048, 50, 0),  // alloc
+            (1, 0xD, 2048, 100, 0), // free_requested — creates the one rect
+            (2, 0xD, 2048, 101, 0), // free_completed — must NOT create another
+        ];
+        let rects = pair_alloc_free(&events, 1000, &[]);
+        assert_eq!(
+            rects.len(),
+            1,
+            "alloc/free_requested/free_completed should produce exactly one rect"
+        );
+        assert_eq!(rects[0].start_us, 50);
+        assert_eq!(rects[0].end_us, 100);
+    }
 }
