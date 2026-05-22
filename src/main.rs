@@ -538,9 +538,16 @@ struct PolygonLayout {
     frame_strings: Vec<String>,
     /// Paired annotations.
     annotations: Vec<PairedAnnotation>,
-    /// Time range in microseconds.
+    /// Time range in microseconds (of the events that were actually loaded,
+    /// i.e. post-filter).
     time_min_us: i64,
     time_max_us: i64,
+    /// Origin used for axis-label display: the time_us of the first event in
+    /// the *original* trace, before any --time-start-sec window was applied.
+    /// Equals `time_min_us` when no window is active. Labels are computed as
+    /// `(val - display_origin_us) / 1e6` so that a filtered view at 12.5s
+    /// shows "12.5s" at the left edge rather than "0s".
+    display_origin_us: i64,
     /// Peak total memory (tracked + summarized).
     peak_bytes: u64,
     /// Stats.
@@ -562,6 +569,7 @@ fn build_polygon_layout(
     annotations: Vec<PairedAnnotation>,
     time_min_us: i64,
     time_max_us: i64,
+    display_origin_us: i64,
     total_events: usize,
     max_entries: usize,
     collapse_static_baselines: bool,
@@ -836,6 +844,7 @@ fn build_polygon_layout(
         annotations,
         time_min_us,
         time_max_us,
+        display_origin_us,
         peak_bytes: peak as u64,
         total_events,
         total_rects,
@@ -1884,8 +1893,8 @@ impl eframe::App for MemoryVizApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "View: {} - {} | {} - {}",
-                        Self::format_axis_time_us(self.view_x_min_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
-                        Self::format_axis_time_us(self.view_x_max_us - self.layout.time_min_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_min_us - self.layout.display_origin_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
+                        Self::format_axis_time_us(self.view_x_max_us - self.layout.display_origin_us as f64, (self.view_x_max_us - self.view_x_min_us) / 10.0),
                         Self::format_bytes(self.view_y_min_bytes + self.memory_offset_bytes),
                         Self::format_bytes(self.view_y_max_bytes + self.memory_offset_bytes),
                     ));
@@ -1911,7 +1920,7 @@ impl eframe::App for MemoryVizApp {
         let shape_str = bottom_info
             .as_ref()
             .and_then(|info| self.format_tensor_shape(info.size_bytes));
-        let time_min_us = self.layout.time_min_us as f64;
+        let time_min_us = self.layout.display_origin_us as f64;
 
         egui::TopBottomPanel::bottom("hover_info")
             .exact_height(100.0)
@@ -2077,7 +2086,7 @@ impl eframe::App for MemoryVizApp {
                     egui::Stroke::new(0.5, grid_color),
                 );
                 let val = vx_min + frac as f64 * x_range;
-                let relative = val - self.layout.time_min_us as f64;
+                let relative = val - self.layout.display_origin_us as f64;
                 painter.text(
                     egui::pos2(x, chart_rect.max.y + 6.0),
                     egui::Align2::CENTER_TOP,
@@ -2417,11 +2426,11 @@ impl eframe::App for MemoryVizApp {
                             ui.label(format!(
                                 "Time: {} - {}",
                                 Self::format_axis_time_us(
-                                    info.start_us as f64 - self.layout.time_min_us as f64,
+                                    info.start_us as f64 - self.layout.display_origin_us as f64,
                                     tick_sp,
                                 ),
                                 Self::format_axis_time_us(
-                                    info.end_us as f64 - self.layout.time_min_us as f64,
+                                    info.end_us as f64 - self.layout.display_origin_us as f64,
                                     tick_sp,
                                 ),
                             ));
@@ -2455,7 +2464,7 @@ impl eframe::App for MemoryVizApp {
                             }
                         });
                     } else if !self.tooltip_dismissed {
-                        let rel_us = hover_us - self.layout.time_min_us as f64;
+                        let rel_us = hover_us - self.layout.display_origin_us as f64;
                         egui::show_tooltip_at_pointer(ctx, response.layer_id, egui::Id::new("cursor_tooltip"), |ui| {
                             ui.label(format!(
                                 "t = {} | mem = {}",
@@ -2658,7 +2667,7 @@ impl eframe::App for MemoryVizApp {
                 Self::draw_ruler(&painter, ruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.memory_offset_bytes);
             }
             if let Some(ref hruler) = self.hruler {
-                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.time_min_us as f64);
+                Self::draw_hruler(&painter, hruler, &bytes_to_screen_y, &us_to_screen_x, chart_rect, self.layout.display_origin_us as f64);
             }
 
             // Dismiss rulers with Escape
@@ -2840,8 +2849,12 @@ fn main() -> Result<()> {
     // outside the window).
     let mut annotations_raw = snapshot.annotations;
     let mut live_blocks = snapshot.live_blocks;
+    // Capture the original trace's first event time BEFORE any filtering, so
+    // axis labels remain anchored to it (a windowed view at 12.5s shows
+    // "12.5s" at the left edge instead of "0s").
+    let original_trace_start = events.first().map(|e| e.3).unwrap_or(0);
     if cli.time_start_sec.is_some() || cli.time_end_sec.is_some() {
-        let trace_start = events.first().map(|e| e.3).unwrap_or(0);
+        let trace_start = original_trace_start;
         let lo = cli
             .time_start_sec
             .map(|s| trace_start + (s * 1e6) as i64)
@@ -2851,14 +2864,44 @@ fn main() -> Result<()> {
             .map(|s| trace_start + (s * 1e6) as i64)
             .unwrap_or(i64::MAX);
         let before = events.len();
+
+        // Pre-pass: walk events strictly before `lo` to find allocations
+        // that were live at the start of the window (alloc'd but not yet
+        // freed). Feed them into `live_blocks` so they're rendered via the
+        // segments-style static-baseline path (a single collapsed bottom
+        // block by default, optionally per-rect via
+        // --no-collapse-static-baselines). This trades baseline detail
+        // (we no longer show baseline frees within the window) for
+        // dramatically less work in build_polygon_layout.
+        let mut live_at_start: HashMap<u64, u64> = HashMap::new();
+        for &(action, addr, size, time_us, _frame_idx) in events.iter() {
+            if time_us >= lo {
+                break;
+            }
+            match action {
+                0 => {
+                    live_at_start.insert(addr, size);
+                }
+                1 | 2 => {
+                    live_at_start.remove(&addr);
+                }
+                _ => {}
+            }
+        }
+
         events.retain(|e| e.3 >= lo && e.3 <= hi);
         annotations_raw.retain(|a| a.time_us >= lo && a.time_us <= hi);
         live_blocks.clear();
+        let n_baselines = live_at_start.len();
+        for (addr, size) in live_at_start {
+            live_blocks.push((addr, size));
+        }
         eprintln!(
-            "  time-window filter: kept {} of {} events ({} ann)",
+            "  time-window filter: kept {} of {} events ({} ann); {} live-at-window-start allocs added as static baselines",
             events.len(),
             before,
-            annotations_raw.len()
+            annotations_raw.len(),
+            n_baselines,
         );
     }
 
@@ -2895,6 +2938,7 @@ fn main() -> Result<()> {
         annotations,
         time_min,
         time_max,
+        original_trace_start,
         total_events,
         cli.max_entries,
         !cli.no_collapse_static_baselines,
